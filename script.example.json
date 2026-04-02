@@ -3,8 +3,8 @@
   "enabled": true,
   "name": "生图大师-自动从URL更新",
   "id": "b354d35f-8b11-4f78-a7d7-0fd2df8a6c61",
-  "content": "import 'https://your-cdn.example.com/gen-master.js'",
-  "info": "酒馆助手脚本版生图大师。主入口在左下角魔棒工具菜单，同时保留“生图大师 / 手动生词”脚本按钮，不在 SillyTavern 扩展列表。",
+  "content": "import 'https://cdn.jsdelivr.net/gh/qinfengge/tavern-helper@main/gen-master.js'",
+  "info": "酒馆助手脚本版生图大师。主入口在左下角魔棒工具菜单，同时保留“生图大师 / 手动生词”脚本按钮，不在 SillyTavern 扩展列表。远程脚本地址必须返回 JavaScript MIME type，不能是 text/plain。",
   "button": {
     "enabled": true,
     "buttons": [

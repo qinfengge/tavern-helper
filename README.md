@@ -23,6 +23,20 @@
    - `button.enabled` 已启用
    - 两个按钮都可见
 
+## 远程地址要求
+
+- 远程 `gen-master.js` 必须以 JavaScript 模块 MIME type 返回，例如 `text/javascript` 或 `application/javascript`。
+- 如果服务器返回的是 `text/plain`，浏览器会直接报错：
+  `Failed to load module script: Expected a JavaScript module script but the server responded with a MIME type of "text/plain".`
+- 这类报错出现时，脚本根本不会执行，入口自然也不会显示。
+
+## 推荐地址
+
+- 如果你直接使用 GitHub 仓库，优先用 jsDelivr，而不是 `raw` 地址。
+- 当前仓库可直接使用：
+  `https://cdn.jsdelivr.net/gh/qinfengge/tavern-helper@main/gen-master.js`
+- 如果你使用阿里云 OSS / 自建静态服务，请把该文件的 `Content-Type` 改为 `text/javascript`。
+
 ## 当前实现
 
 - 使用酒馆助手脚本变量 API 保存配置，失败时回退到 `localStorage`
