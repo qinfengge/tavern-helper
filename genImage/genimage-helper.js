@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         生图助手 v2
-// @version      v2.2.0
+// @version      v2.2.4
 // @description  两步LLM串行生图：角色锚点(自然语言) + 场景描述，内置Z-Image ComfyUI工作流
 // @author       GenImage Helper
 // @match        */*
@@ -298,12 +298,12 @@
             savedWorkflows: {},
             paramOverrides: {
                 model_name: '',      // 统一模型字段，自动写入 checkpoint 或 unet 节点
-                steps: 20,
-                cfg: 7,
+                steps: 4,
+                cfg: 1.0,
                 width: 832,
                 height: 1216,
                 sampler_name: 'euler',
-                scheduler: 'normal',
+                scheduler: 'simple',
                 seed: -1,
             },
             loras: [],               // [{ name, strength }]
@@ -901,15 +901,17 @@
 
     // ========== COMFYUI ==========
 
-    // 内置 Z-Image 工作流（自然语言文本条件，适合 Flux/SD3 等模型）
+    // 内置 Z-Image Turbo 工作流（UNETLoader + DualCLIPLoader，适合 Z-Image/Flux 模型）
     const Z_IMAGE_WORKFLOW = {
-        "1": { "class_type":"CheckpointLoaderSimple", "inputs":{ "ckpt_name":"flux1-dev-fp8.safetensors" } },
-        "2": { "class_type":"CLIPTextEncode", "inputs":{ "text":"", "clip":["1",1] } },
-        "3": { "class_type":"CLIPTextEncode", "inputs":{ "text":"", "clip":["1",1] } },
-        "4": { "class_type":"EmptyLatentImage", "inputs":{ "width":832, "height":1216, "batch_size":1 } },
-        "5": { "class_type":"KSampler", "inputs":{ "model":["1",0], "positive":["2",0], "negative":["3",0], "latent_image":["4",0], "seed":42, "steps":20, "cfg":7, "sampler_name":"euler", "scheduler":"normal", "denoise":1 } },
-        "6": { "class_type":"VAEDecode", "inputs":{ "samples":["5",0], "vae":["1",2] } },
-        "7": { "class_type":"SaveImage", "inputs":{ "images":["6",0], "filename_prefix":"GI-" } }
+        "1": { "class_type":"UNETLoader",      "inputs":{ "unet_name":"z-image-turbo.safetensors", "weight_dtype":"default" } },
+        "2": { "class_type":"DualCLIPLoader",  "inputs":{ "clip_name1":"clip_l.safetensors", "clip_name2":"t5xxl_fp8_e4m3fn.safetensors", "type":"flux" } },
+        "3": { "class_type":"CLIPTextEncode",  "inputs":{ "text":"", "clip":["2",0] } },
+        "4": { "class_type":"CLIPTextEncode",  "inputs":{ "text":"", "clip":["2",0] } },
+        "5": { "class_type":"EmptyLatentImage","inputs":{ "width":832, "height":1216, "batch_size":1 } },
+        "6": { "class_type":"KSampler",        "inputs":{ "model":["1",0], "positive":["3",0], "negative":["4",0], "latent_image":["5",0], "seed":42, "steps":4, "cfg":1.0, "sampler_name":"euler", "scheduler":"simple", "denoise":1 } },
+        "7": { "class_type":"VAELoader",       "inputs":{ "vae_name":"ae.safetensors" } },
+        "8": { "class_type":"VAEDecode",       "inputs":{ "samples":["6",0], "vae":["7",0] } },
+        "9": { "class_type":"SaveImage",       "inputs":{ "images":["8",0], "filename_prefix":"GI-" } }
     };
 
     function getComfyUIBaseUrl() {
@@ -917,20 +919,46 @@
         return `${useHttps ? 'https' : 'http'}://${host}:${port}`;
     }
 
+    // 沿连接链向上追溯，找到最近的 CLIPTextEncode* 节点
+    function resolveToTextEncoder(workflow, nodeId, depth) {
+        depth = depth || 0;
+        if (depth > 8 || !nodeId || !workflow[nodeId]) return null;
+        const node = workflow[nodeId];
+        if (/CLIPTextEncode/.test(node.class_type || '')) return nodeId;
+        for (const val of Object.values(node.inputs || {})) {
+            if (Array.isArray(val) && val.length >= 2 && typeof val[0] === 'string' && workflow[val[0]]) {
+                const found = resolveToTextEncoder(workflow, val[0], depth + 1);
+                if (found) return found;
+            }
+        }
+        return null;
+    }
+
     function autoMapNodes(workflow) {
         const map = { positive_node:null, negative_node:null, sampler_node:null, latent_node:null, checkpoint_node:null, unet_node:null, lora_nodes:[] };
+        const textEncoders = [];
         for (const [id, node] of Object.entries(workflow)) {
-            if (node.class_type === 'KSampler' || node.class_type === 'KSamplerAdvanced') {
-                map.sampler_node = id;
-                const p = node.inputs?.positive, n = node.inputs?.negative;
-                if (Array.isArray(p)) map.positive_node = p[0];
-                if (Array.isArray(n)) map.negative_node = n[0];
-            }
-            if (/EmptyLatentImage|EmptySD3LatentImage|EmptyHunyuanLatentVideo/.test(node.class_type)) map.latent_node = id;
-            if (/CheckpointLoaderSimple|CheckpointLoader/.test(node.class_type)) map.checkpoint_node = id;
-            if (/UNETLoader/.test(node.class_type)) map.unet_node = id;
-            if (/LoraLoader|LoRALoader/.test(node.class_type)) map.lora_nodes.push(id);
+            const ct = node.class_type || '';
+            if (ct === 'KSampler' || ct === 'KSamplerAdvanced') map.sampler_node = id;
+            if (/SamplerCustomAdvanced/.test(ct) && !map.sampler_node) map.sampler_node = id;
+            if (/EmptyLatentImage|EmptySD3LatentImage|EmptyHunyuanLatentVideo/.test(ct)) map.latent_node = id;
+            if (/CheckpointLoaderSimple|CheckpointLoader$/.test(ct)) map.checkpoint_node = id;
+            if (/UNETLoader/.test(ct)) map.unet_node = id;
+            if (/LoraLoader|LoRALoader/.test(ct)) map.lora_nodes.push(id);
+            if (/CLIPTextEncode/.test(ct)) textEncoders.push(id);
         }
+        textEncoders.sort((a, b) => Number(a) - Number(b));
+        if (map.sampler_node) {
+            const sampler = workflow[map.sampler_node];
+            // SamplerCustomAdvanced uses "guider" instead of "positive"
+            const posRef = sampler.inputs?.positive || sampler.inputs?.guider;
+            const negRef = sampler.inputs?.negative;
+            if (Array.isArray(posRef)) map.positive_node = resolveToTextEncoder(workflow, posRef[0]);
+            if (Array.isArray(negRef)) map.negative_node = resolveToTextEncoder(workflow, negRef[0]);
+        }
+        // 回退：按 id 顺序取前两个文本编码器
+        if (!map.positive_node && textEncoders.length > 0) map.positive_node = textEncoders[0];
+        if (!map.negative_node && textEncoders.length > 1) map.negative_node = textEncoders[1];
         return map;
     }
 
