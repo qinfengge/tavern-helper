@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         生图助手 v2
-// @version      v2.1.0
+// @version      v2.2.0
 // @description  两步LLM串行生图：角色锚点(自然语言) + 场景描述，内置Z-Image ComfyUI工作流
 // @author       GenImage Helper
 // @match        */*
@@ -137,6 +137,16 @@
             sampler: '采样器',
             scheduler: '调度器',
             seed: '种子(-1随机)',
+            prompt_language: '提示词语言',
+            prompt_lang_zh: '中文',
+            prompt_lang_en: '英文',
+            gen_all_anchors: '生成全部角色锚点',
+            anchor_all_chars: '全部角色锚点',
+            regen: '重新生成',
+            anchor_ops: '操作',
+            anchor_desc: '外貌描述',
+            model_fetch: '获取模型列表',
+            fetch_workflows: '从服务器获取',
         },
         en: {
             settings: 'Settings',
@@ -204,6 +214,16 @@
             sampler: 'Sampler',
             scheduler: 'Scheduler',
             seed: 'Seed (-1=random)',
+            prompt_language: 'Prompt Language',
+            prompt_lang_zh: 'Chinese',
+            prompt_lang_en: 'English',
+            gen_all_anchors: 'Generate All Anchors',
+            anchor_all_chars: 'All Character Anchors',
+            regen: 'Regen',
+            anchor_ops: 'Actions',
+            anchor_desc: 'Description',
+            model_fetch: 'Fetch Models',
+            fetch_workflows: 'Fetch from Server',
         }
     };
 
@@ -215,6 +235,7 @@
     const DEFAULT_SETTINGS = {
         enabled: true,
         language: 'zh',
+        promptLanguage: 'zh',   // 'zh' | 'en' — 生成提示词的语言
         autoGenerate: true,
         debounceMs: 1000,
 
@@ -227,23 +248,23 @@
             temperature: 0.7,
         },
 
-        // 角色锚点：绑定角色卡，自动生成自然语言外貌描述
+        // 角色锚点：从世界书提取所有角色的固定外貌描述
         anchorConfig: {
             enabled: true,
             cacheEnabled: true,
-            // 提示词：要求LLM输出自然语言描述，适配Z-Image格式
+            // 提示词：要求LLM识别世界书中所有角色并输出外貌描述数组
             template: `你是一个角色视觉描述专家，服务于AI图像生成工作流（Z-Image）。
-根据以下角色卡描述和世界书信息，用自然语言描述这个角色的固定外貌特征。
+根据以下世界书信息，识别所有主要角色，并为每个角色生成一段自然语言外貌描述。
 
 要求：
-1. 使用自然语言，不使用逗号分隔的关键词标签
-2. 描述角色的外貌特征：体型、发色发型、眼睛颜色、皮肤、面部特征等固定特征
-3. 描述默认服装和配饰
-4. 语言简洁，专注于视觉可描述的外貌，避免性格描述
-5. 用英文输出（因为Z-Image工作流使用英文提示词）
+1. 识别世界书中所有主要角色（包括主角、配角、重要NPC）
+2. 使用自然语言，不使用逗号分隔的关键词标签
+3. 描述每个角色的固定视觉特征：体型、发色发型、眼睛颜色、皮肤、面部特征、默认服装
+4. 专注于视觉可描述的外貌，避免性格/背景描述
+5. 语言根据用户设置输出（中文或英文）
 
-必须以纯JSON格式回复：
-{"character_name":"角色中文名","description":"A [gender] with [hair description], [eye description], [skin/face], wearing [default outfit]. [Other notable visual features]."}`
+必须以纯JSON数组格式回复（不要任何其他内容）：
+[{"character_name":"角色名","description":"对角色外貌的完整自然语言描述"},...]`
         },
 
         sceneConfig: {
@@ -282,6 +303,7 @@
             },
             loras: [],               // [{ name, strength }]
             availableLoras: [],      // 从ComfyUI获取的可用LoRA列表（仅运行时）
+            availableModels: [],     // 从ComfyUI获取的可用模型列表（仅运行时）
         },
 
         promptConfig: {
@@ -404,6 +426,13 @@
     .gi-status.err { display:block; background:rgba(200,80,80,0.12); color:#ff8080; border-left:2px solid #ff8080; }
     /* Settings popup */
     .gi-settings-popup h4 { color:var(--nm-text)!important; font-weight:600; margin:14px 0 8px; font-size:0.92em; }
+    /* Anchor table */
+    .gi-anchor-table { margin:8px 0; }
+    .gi-anchor-table-header { display:grid; grid-template-columns:90px 1fr 110px; gap:8px; padding:5px 8px; font-size:0.75em; color:var(--nm-text-muted); text-transform:uppercase; letter-spacing:0.5px; border-bottom:1px solid var(--nm-border); margin-bottom:4px; }
+    .gi-anchor-table-row { display:grid; grid-template-columns:90px 1fr 110px; gap:8px; align-items:start; padding:7px 8px; background:linear-gradient(145deg,#252530,#1e1e24); border-radius:6px; margin-bottom:4px; }
+    .gi-anchor-table-name { color:var(--nm-accent); font-size:0.82em; font-weight:600; font-family:'Consolas',monospace; word-break:break-all; padding-top:2px; }
+    .gi-anchor-table-desc { color:var(--nm-text); font-size:0.8em; line-height:1.5; font-style:italic; }
+    .gi-anchor-table-ops { display:flex; flex-direction:column; gap:4px; }
     `;
 
     // ========== UTILITIES ==========
@@ -648,19 +677,83 @@
         }
     }
 
+    /** 返回提示词语言指令，注入到 LLM system prompt 末尾 */
+    function getLangInstruction() {
+        const lang = settings.promptLanguage || 'zh';
+        return lang === 'zh'
+            ? '\n\n【语言要求】所有 description 字段必须使用中文自然语言描述。'
+            : '\n\n【Language】All description fields must be written in English natural language.';
+    }
+
     /**
-     * Step 1: 生成角色锚点（自然语言外貌描述，Z-Image格式）
-     * - 从世界书自动读取，不依赖角色卡描述
-     * - 按角色名永久缓存（只生成一次），forceRefresh=true 时强制重新生成
-     * - 支持多角色，每个角色独立缓存
+     * Step 1: 生成全部角色锚点（一次性从世界书识别所有角色）
+     * - 返回所有新生成的锚点数组
+     * - 只生成一次并持久化，forceRefresh=true 时强制重新生成所有
+     */
+    async function generateAllCharacterAnchors(forceRefresh = false) {
+        if (!settings.anchorConfig.enabled) return [];
+
+        const wbContent = await getAllCharacterWorldbookContent();
+        if (!wbContent.trim()) {
+            addLog('ANCHOR', '世界书为空，无法生成角色锚点');
+            return [];
+        }
+
+        addLog('ANCHOR', `生成全部角色锚点 (forceRefresh=${forceRefresh})`);
+
+        const sysPrompt = settings.anchorConfig.template + getLangInstruction();
+        const userContent = `世界书资料：\n\n${wbContent}`;
+        const messages = [
+            { role:'system', content: sysPrompt },
+            { role:'user',   content: userContent }
+        ];
+
+        try {
+            const raw = await callLLM(messages);
+            // 期望 LLM 返回 JSON 数组
+            let parsed = extractJsonFromText(raw);
+            // 兼容：LLM 可能返回单对象或包在 "characters" 键里
+            if (parsed && !Array.isArray(parsed)) {
+                parsed = parsed.characters || parsed.anchors || [parsed];
+            }
+            if (!Array.isArray(parsed) || !parsed.length) {
+                throw new Error('解析锚点数组失败: ' + raw.substring(0, 120));
+            }
+
+            const results = [];
+            for (const item of parsed) {
+                if (!item?.description) continue;
+                const name = (item.character_name || item.name || '').trim();
+                if (!name) continue;
+                // 如果未强制刷新且已有缓存，跳过该角色
+                if (!forceRefresh && anchorCache[name]?.description) {
+                    addLog('ANCHOR', `跳过(已缓存): ${name}`);
+                    results.push(anchorCache[name]);
+                    continue;
+                }
+                const anchor = { character_name: name, description: item.description.trim() };
+                anchorCache[name] = anchor;
+                results.push(anchor);
+                addLog('ANCHOR', `锚点已生成: ${name} — ${anchor.description.substring(0, 60)}...`);
+            }
+            saveAnchorCache();
+            addLog('ANCHOR', `共生成/更新 ${results.length} 个角色锚点`);
+            return results;
+        } catch (e) {
+            addLog('ANCHOR', `生成失败: ${e.message}`);
+            return [];
+        }
+    }
+
+    /**
+     * 重新生成单个角色锚点（用于设置面板"重新生成"按钮）
      */
     async function generateCharacterAnchor(charName, forceRefresh = false) {
         if (!settings.anchorConfig.enabled) return null;
 
         charName = charName || getCurrentCharacterName();
-        if (!charName) { addLog('ANCHOR', '未找到当前角色'); return null; }
+        if (!charName) { addLog('ANCHOR', '未找到角色名'); return null; }
 
-        // 永久缓存命中：只要存在就不重新生成（除非强制刷新）
         if (!forceRefresh && anchorCache[charName]?.description) {
             addLog('ANCHOR', `命中缓存: ${charName}`);
             return anchorCache[charName];
@@ -668,36 +761,56 @@
 
         const wbContent = await getAllCharacterWorldbookContent();
         if (!wbContent.trim()) {
-            addLog('ANCHOR', `${charName}: 世界书为空，无法生成锚点`);
+            addLog('ANCHOR', `${charName}: 世界书为空`);
             return null;
         }
 
-        addLog('ANCHOR', `生成角色锚点: ${charName}`);
-
-        const userContent = `角色名: ${charName}\n\n世界书资料:\n${wbContent}`;
+        const sysPrompt = settings.anchorConfig.template + getLangInstruction();
+        // 单角色版本：要求只描述指定角色，返回单对象
+        const userContent = `只描述角色"${charName}"的外貌。\n\n世界书资料：\n${wbContent}\n\n必须以单个JSON对象回复：{"character_name":"${charName}","description":"..."}`;
         const messages = [
-            { role:'system', content: settings.anchorConfig.template },
+            { role:'system', content: sysPrompt },
             { role:'user',   content: userContent }
         ];
 
         try {
             const raw = await callLLM(messages);
-            const parsed = extractJsonFromText(raw);
-            if (!parsed?.description) throw new Error('解析锚点JSON失败: ' + raw.substring(0, 120));
+            let parsed = extractJsonFromText(raw);
+            if (Array.isArray(parsed)) parsed = parsed.find(x => x.character_name === charName) || parsed[0];
+            if (!parsed?.description) throw new Error('解析失败: ' + raw.substring(0, 120));
 
-            const anchor = {
-                character_name: parsed.character_name || charName,
-                description: parsed.description.trim()
-            };
-            // 存入缓存并持久化
+            const anchor = { character_name: charName, description: parsed.description.trim() };
             anchorCache[charName] = anchor;
             saveAnchorCache();
-            addLog('ANCHOR', `锚点生成成功: ${anchor.description.substring(0, 80)}...`);
+            addLog('ANCHOR', `单角色锚点完成: ${charName}`);
             return anchor;
         } catch (e) {
             addLog('ANCHOR', `生成失败: ${e.message}`);
             return null;
         }
+    }
+
+    /**
+     * 从消息文本中检测提及了哪些已缓存角色，返回对应锚点数组
+     * senderName: 消息发送方（总是包含）
+     */
+    function detectCharactersInText(text, senderName) {
+        const anchors = [];
+        const seen = new Set();
+        // 发送方锚点优先
+        if (senderName && anchorCache[senderName]) {
+            anchors.push(anchorCache[senderName]);
+            seen.add(senderName);
+        }
+        // 遍历缓存，检测文本中出现的角色名
+        for (const [name, anchor] of Object.entries(anchorCache)) {
+            if (seen.has(name)) continue;
+            if (text.includes(name)) {
+                anchors.push(anchor);
+                seen.add(name);
+            }
+        }
+        return anchors;
     }
 
     // ========== STEP 2: SCENE DESCRIPTION ==========
@@ -726,18 +839,20 @@
         } catch (_) { return ''; }
     }
 
-    async function generateSceneDescription(mesId, messageText, anchor) {
+    // anchors 参数：{ character_name, description }[] 或单个对象或 null
+    async function generateSceneDescription(mesId, messageText, anchors) {
         const paragraphs = extractParagraphs(messageText);
         const numberedText = paragraphs.map((p, i) => `[P${i+1}] ${p}`).join('\n\n');
         const history = getChatHistory(mesId, settings.sceneConfig.historyCount);
 
-        // 把锚点的自然语言描述提供给LLM，要求原样融入
-        const anchorInfo = anchor
-            ? `角色固定外貌描述（必须原样包含在prompt中）:\n"${anchor.description}"`
+        // 支持数组或单个锚点
+        const anchorList = Array.isArray(anchors) ? anchors : (anchors ? [anchors] : []);
+        const anchorInfo = anchorList.length
+            ? anchorList.map(a => `【${a.character_name}】${a.description}`).join('\n')
             : '（无角色锚点，根据上下文描述角色外貌）';
 
         const userContent = [
-            '## 角色锚点（固定外貌）',
+            '## 角色外貌锚点（固定特征，必须原样融入相关角色的prompt）',
             anchorInfo,
             '',
             history ? '## 历史上下文（仅供参考）\n' + history : '',
@@ -746,8 +861,9 @@
             numberedText
         ].filter(Boolean).join('\n');
 
+        const sysPrompt = settings.sceneConfig.template + getLangInstruction();
         const messages = [
-            { role:'system', content: settings.sceneConfig.template },
+            { role:'system', content: sysPrompt },
             { role:'user',   content: userContent }
         ];
 
@@ -906,6 +1022,33 @@
     }
 
     /**
+     * 从 ComfyUI 获取可用模型（Checkpoint）列表
+     */
+    async function fetchComfyUIModels() {
+        const res = await safeFetch(`${getComfyUIBaseUrl()}/object_info/CheckpointLoaderSimple`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const modelList = data?.CheckpointLoaderSimple?.input?.required?.ckpt_name?.[0];
+        if (!Array.isArray(modelList)) throw new Error('未找到模型列表');
+        return modelList.filter(Boolean);
+    }
+
+    /**
+     * 从 ComfyUI 获取工作流列表 (需要 ComfyUI >= 0.2.x 的 /userdata 接口)
+     */
+    async function fetchComfyUIWorkflows() {
+        const res = await safeFetch(`${getComfyUIBaseUrl()}/userdata?dir=workflows&recurse=true`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        // data 可能是字符串数组或对象数组
+        if (!Array.isArray(data)) throw new Error('格式不支持');
+        return data
+            .map(x => (typeof x === 'string' ? x : x.path || x.name || ''))
+            .filter(x => x.endsWith('.json'))
+            .map(x => x.replace(/\\/g, '/'));
+    }
+
+    /**
      * 从 ComfyUI 获取可用 LoRA 列表
      * 调用 /object_info/LoraLoader
      */
@@ -1056,11 +1199,18 @@
         const senderName = msg.name || getCurrentCharacterName();
         addLog('AUTO', `自动生图 mesId=${mesId} sender=${senderName}`);
         try {
-            if (typeof toastr !== 'undefined') toastr.info(t('anchor_generating'), null, { timeOut:3000 });
-            const anchor = await generateCharacterAnchor(senderName);
+            // 如果还没有任何缓存，先生成全部角色锚点
+            if (settings.anchorConfig.enabled && Object.keys(anchorCache).length === 0) {
+                if (typeof toastr !== 'undefined') toastr.info(t('anchor_generating'), null, { timeOut:5000 });
+                await generateAllCharacterAnchors();
+            }
+
+            // 检测当前消息涉及哪些角色，组合多角色锚点
+            const anchors = detectCharactersInText(messageText, senderName);
+            addLog('AUTO', `检测到 ${anchors.length} 个角色锚点`);
 
             if (typeof toastr !== 'undefined') toastr.info(t('scene_generating'), null, { timeOut:3000 });
-            const { insertions, paragraphs } = await generateSceneDescription(mesId, messageText, anchor);
+            const { insertions, paragraphs } = await generateSceneDescription(mesId, messageText, anchors);
 
             const newText = insertInsertionsIntoOriginal(messageText, paragraphs, insertions);
             await safeUpdateChatMessage(mesId, newText);
@@ -1285,8 +1435,6 @@
         if (settingsOpen) { closeSettingsPopup(); return; }
         settingsOpen = true;
 
-        const curAnchor = anchorCache[getCurrentCharacterName()];
-
         const popup = $(`
         <div id="gi-settings-overlay" style="position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:99998;display:flex;align-items:center;justify-content:center;">
           <div class="gi-settings-popup" style="background:var(--nm-bg);border-radius:var(--nm-radius);padding:22px;width:min(720px,96vw);max-height:92vh;overflow-y:auto;box-shadow:8px 8px 20px var(--nm-shadow-dark),-4px -4px 12px var(--nm-shadow-light);color:var(--nm-text);font-family:'Georgia','Times New Roman','Noto Serif SC',serif;position:relative;">
@@ -1308,6 +1456,8 @@
                     <label class="gi-toggle"><input type="checkbox" id="gi-enabled" ${settings.enabled?'checked':''}><span class="gi-toggle-slider"></span></label></div>
                 <div class="gi-row"><label>${t('language')}</label>
                     <select id="gi-language"><option value="zh" ${settings.language==='zh'?'selected':''}>中文</option><option value="en" ${settings.language==='en'?'selected':''}>English</option></select></div>
+                <div class="gi-row"><label>${t('prompt_language')}</label>
+                    <select id="gi-prompt-lang"><option value="zh" ${(settings.promptLanguage||'zh')==='zh'?'selected':''}>${t('prompt_lang_zh')}</option><option value="en" ${(settings.promptLanguage||'zh')==='en'?'selected':''}>${t('prompt_lang_en')}</option></select></div>
                 <div class="gi-row"><label>${t('auto_generate')}</label>
                     <label class="gi-toggle"><input type="checkbox" id="gi-auto-gen" ${settings.autoGenerate?'checked':''}><span class="gi-toggle-slider"></span></label></div>
                 <div class="gi-row"><label>${t('debounce_ms')}</label>
@@ -1345,13 +1495,10 @@
                 <div class="gi-row"><label>${t('anchor_cache')}</label>
                     <label class="gi-toggle"><input type="checkbox" id="gi-anchor-cache" ${settings.anchorConfig.cacheEnabled?'checked':''}><span class="gi-toggle-slider"></span></label></div>
 
-                <div class="gi-sec-title">${t('anchor_current')}</div>
-                <div class="gi-anchor-box" id="gi-anchor-preview">
-                    <div class="gi-anchor-name">${curAnchor ? `角色: ${escapeHtml(curAnchor.character_name)}` : ''}</div>
-                    <div class="gi-anchor-desc">${curAnchor ? escapeHtml(curAnchor.description) : `<span style="color:var(--nm-text-muted);font-style:normal;">${t('anchor_empty')}</span>`}</div>
-                </div>
-                <div class="gi-controls">
-                    <button class="gi-btn" id="gi-gen-anchor">${t('gen_anchor')}</button>
+                <div class="gi-sec-title">${t('anchor_all_chars')}</div>
+                <div id="gi-anchor-table"></div>
+                <div class="gi-controls" style="margin-top:8px;">
+                    <button class="gi-btn" id="gi-gen-all-anchors">${t('gen_all_anchors')}</button>
                     <button class="gi-btn gi-btn-sec" id="gi-clear-anchor">${t('clear_anchor_cache')}</button>
                 </div>
                 <div id="gi-anchor-status" style="font-size:0.82em;color:var(--nm-text-muted);margin-top:8px;"></div>
@@ -1377,10 +1524,12 @@
 
                 <div class="gi-sec-title">${t('active_workflow')}</div>
                 <div class="gi-row"><label>${t('active_workflow')}</label>
-                    <select id="gi-workflow-select">${buildWorkflowOptions()}</select>
-                    <button class="gi-btn gi-btn-sec gi-btn-sm" id="gi-upload-workflow" style="margin-left:6px;flex-shrink:0;">${t('upload_workflow')}</button>
+                    <select id="gi-workflow-select" style="flex:1;">${buildWorkflowOptions()}</select>
+                    <button class="gi-btn gi-btn-sec gi-btn-sm" id="gi-fetch-workflows" style="margin-left:4px;flex-shrink:0;">${t('fetch_workflows')}</button>
+                    <button class="gi-btn gi-btn-sec gi-btn-sm" id="gi-upload-workflow" style="margin-left:4px;flex-shrink:0;">${t('upload_workflow')}</button>
                     <input type="file" id="gi-workflow-file" accept=".json" style="display:none;">
                 </div>
+                <div id="gi-workflow-fetch-status" style="font-size:0.8em;color:var(--nm-text-muted);margin-bottom:4px;"></div>
                 <div class="gi-sec-title">${t('workflow_preview')}</div>
                 <div class="gi-workflow-preview" id="gi-wf-preview">${buildWorkflowPreviewHtml(getCurrentWorkflowJson())}</div>
 
@@ -1433,6 +1582,7 @@
 
         $('body').append(popup);
         renderActiveLoraList();
+        renderAnchorTable();
 
         // ---- Tab switching ----
         popup.on('click', '.gi-tab-btn', function () {
@@ -1487,25 +1637,65 @@
         });
 
         // ---- Anchor ----
-        $('#gi-gen-anchor').on('click', async function () {
+        $('#gi-gen-all-anchors').on('click', async function () {
             const btn = $(this).prop('disabled', true).text(t('anchor_generating'));
+            $('#gi-anchor-status').text('生成中...');
             try {
-                const anchor = await generateCharacterAnchor(null, true);
-                if (anchor) {
-                    $('#gi-anchor-preview').html(`<div class="gi-anchor-name">角色: ${escapeHtml(anchor.character_name)}</div><div class="gi-anchor-desc">${escapeHtml(anchor.description)}</div>`);
-                    $('#gi-anchor-status').text('✓ 生成成功');
-                } else {
-                    $('#gi-anchor-status').text('✗ 生成失败（世界书为空或LLM调用失败）');
-                }
+                const results = await generateAllCharacterAnchors(true);
+                renderAnchorTable();
+                $('#gi-anchor-status').text(results.length ? `✓ 共生成 ${results.length} 个角色锚点` : '✗ 生成失败（世界书为空或LLM调用失败）');
             } catch (e) { $('#gi-anchor-status').text(`✗ ${e.message}`); }
-            btn.prop('disabled', false).text(t('gen_anchor'));
+            btn.prop('disabled', false).text(t('gen_all_anchors'));
         });
 
         $('#gi-clear-anchor').on('click', function () {
             anchorCache = {};
             saveAnchorCache();
-            $('#gi-anchor-preview').html(`<div class="gi-anchor-desc" style="color:var(--nm-text-muted);font-style:normal;">${t('anchor_empty')}</div>`);
+            renderAnchorTable();
             $('#gi-anchor-status').text('✓ 缓存已清除');
+        });
+
+        // ---- Fetch ComfyUI models ----
+        $('#gi-fetch-models-comfy').on('click', async function () {
+            const btn = $(this).prop('disabled', true).text('获取中...');
+            settings.comfyuiConfig.host = $('#gi-comfyui-host').val();
+            settings.comfyuiConfig.port = parseInt($('#gi-comfyui-port').val());
+            try {
+                const models = await fetchComfyUIModels();
+                settings.comfyuiConfig.availableModels = models;
+                const cur = settings.comfyuiConfig.paramOverrides?.ckpt_name || '';
+                const opts = models.map(m => `<option value="${escapeAttr(m)}" ${m===cur?'selected':''}>${escapeHtml(m)}</option>`).join('');
+                $('#gi-ckpt').html(opts);
+                if (typeof toastr !== 'undefined') toastr.success(`获取到 ${models.length} 个模型`);
+            } catch (e) {
+                if (typeof toastr !== 'undefined') toastr.error(`获取模型失败: ${e.message}`);
+            }
+            btn.prop('disabled', false).text(t('model_fetch'));
+        });
+
+        // ---- Fetch ComfyUI workflows ----
+        $('#gi-fetch-workflows').on('click', async function () {
+            const btn = $(this).prop('disabled', true).text('获取中...');
+            settings.comfyuiConfig.host = $('#gi-comfyui-host').val();
+            settings.comfyuiConfig.port = parseInt($('#gi-comfyui-port').val());
+            try {
+                const files = await fetchComfyUIWorkflows();
+                if (!files.length) throw new Error('未找到工作流文件');
+                // 将工作流文件名作为选项追加到工作流列表
+                for (const path of files) {
+                    const name = path.split('/').pop().replace('.json', '');
+                    if (!settings.comfyuiConfig.savedWorkflows[name]) {
+                        // 占位：标记为从服务器获取（需要手动上传JSON才能使用）
+                        settings.comfyuiConfig.savedWorkflows[name] = { fromServer: true, path, json: null };
+                    }
+                }
+                $('#gi-workflow-select').html(buildWorkflowOptions());
+                $('#gi-workflow-fetch-status').text(`从服务器找到 ${files.length} 个工作流（需上传JSON才能使用）`);
+                if (typeof toastr !== 'undefined') toastr.success(`找到 ${files.length} 个工作流`);
+            } catch (e) {
+                $('#gi-workflow-fetch-status').text(`✗ ${e.message}`);
+            }
+            btn.prop('disabled', false).text(t('fetch_workflows'));
         });
 
         // ---- Workflow select change → update preview ----
@@ -1617,12 +1807,27 @@
         return settings.comfyuiConfig.savedWorkflows?.[wf]?.json || Z_IMAGE_WORKFLOW;
     }
 
+    function buildModelSelectHtml() {
+        const cfg = settings.comfyuiConfig;
+        const models = cfg.availableModels || [];
+        const cur = cfg.paramOverrides?.ckpt_name || '';
+        if (!models.length) {
+            const curOpt = cur ? `<option value="${escapeAttr(cur)}" selected>${escapeHtml(cur)}</option>` : '<option value="">（点击获取）</option>';
+            return `<select id="gi-ckpt" style="flex:1;">${curOpt}</select>`;
+        }
+        const opts = models.map(m => `<option value="${escapeAttr(m)}" ${m===cur?'selected':''}>${escapeHtml(m)}</option>`).join('');
+        return `<select id="gi-ckpt" style="flex:1;">${opts}</select>`;
+    }
+
     function buildParamOverridesHtml() {
         const o = settings.comfyuiConfig.paramOverrides || {};
         const samplers = ['euler','euler_ancestral','heun','dpm_2','dpm_2_ancestral','dpmpp_2s_ancestral','dpmpp_sde','dpmpp_2m','ddim'];
         const scheds   = ['normal','karras','exponential','sgm_uniform','simple','ddim_uniform'];
         return `
-        <div class="gi-row"><label>${t('model_name')}</label><input type="text" id="gi-ckpt" value="${escapeAttr(o.ckpt_name||'')}" placeholder="flux1-dev-fp8.safetensors"></div>
+        <div class="gi-row"><label>${t('model_name')}</label>
+            ${buildModelSelectHtml()}
+            <button class="gi-btn gi-btn-sec gi-btn-sm" id="gi-fetch-models-comfy" style="margin-left:6px;flex-shrink:0;">${t('model_fetch')}</button>
+        </div>
         <div class="gi-row"><label>${t('width')} × ${t('height')}</label>
             <input type="number" id="gi-width"  value="${o.width||832}"  min="64" max="2048" step="64" style="max-width:90px;">
             <span style="color:var(--nm-text-muted);padding:0 4px;">×</span>
@@ -1632,6 +1837,42 @@
         <div class="gi-row"><label>${t('sampler')}</label><select id="gi-sampler">${samplers.map(s=>`<option value="${s}" ${o.sampler_name===s?'selected':''}>${s}</option>`).join('')}</select></div>
         <div class="gi-row"><label>${t('scheduler')}</label><select id="gi-scheduler">${scheds.map(s=>`<option value="${s}" ${o.scheduler===s?'selected':''}>${s}</option>`).join('')}</select></div>
         <div class="gi-row"><label>${t('seed')}</label><input type="number" id="gi-seed" value="${o.seed??-1}" min="-1"></div>`;
+    }
+
+    function renderAnchorTable() {
+        const $table = $('#gi-anchor-table').empty();
+        const entries = Object.entries(anchorCache);
+        if (!entries.length) {
+            $table.html(`<div style="color:var(--nm-text-muted);font-size:0.82em;padding:8px 4px;">${t('anchor_empty')}</div>`);
+            return;
+        }
+        const header = `<div class="gi-anchor-table-header"><span>${t('anchor_char_name')}</span><span>${t('anchor_desc')}</span><span>${t('anchor_ops')}</span></div>`;
+        $table.html(header);
+        for (const [charName, anchor] of entries) {
+            const row = $(`<div class="gi-anchor-table-row">
+                <span class="gi-anchor-table-name" title="${escapeAttr(charName)}">${escapeHtml(charName)}</span>
+                <span class="gi-anchor-table-desc">${escapeHtml(anchor.description || '')}</span>
+                <span class="gi-anchor-table-ops">
+                    <button class="gi-btn gi-btn-sm gi-btn-sec" data-regen="${escapeAttr(charName)}">${t('regen')}</button>
+                    <button class="gi-btn gi-btn-sm gi-btn-danger" data-del="${escapeAttr(charName)}">${t('delete')}</button>
+                </span>
+            </div>`);
+            row.find('[data-regen]').on('click', async function () {
+                const name = $(this).data('regen');
+                $(this).prop('disabled', true).text('...');
+                $('#gi-anchor-status').text(`正在重新生成 ${name}...`);
+                await generateCharacterAnchor(name, true);
+                renderAnchorTable();
+                $('#gi-anchor-status').text(`✓ ${name} 已重新生成`);
+            });
+            row.find('[data-del]').on('click', function () {
+                const name = $(this).data('del');
+                delete anchorCache[name];
+                saveAnchorCache();
+                renderAnchorTable();
+            });
+            $table.append(row);
+        }
     }
 
     function renderAvailableLoraList(loras) {
@@ -1665,10 +1906,11 @@
     }
 
     function collectSettingsFromUI() {
-        settings.enabled      = $('#gi-enabled').is(':checked');
-        settings.language     = $('#gi-language').val();
-        settings.autoGenerate = $('#gi-auto-gen').is(':checked');
-        settings.debounceMs   = parseInt($('#gi-debounce').val()) || 1000;
+        settings.enabled        = $('#gi-enabled').is(':checked');
+        settings.language       = $('#gi-language').val();
+        settings.promptLanguage = $('#gi-prompt-lang').val();
+        settings.autoGenerate   = $('#gi-auto-gen').is(':checked');
+        settings.debounceMs     = parseInt($('#gi-debounce').val()) || 1000;
 
         settings.llmConfig.baseUrl     = $('#gi-llm-url').val().trim();
         settings.llmConfig.apiKey      = $('#gi-llm-key').val().trim();
@@ -1718,14 +1960,11 @@
         if (tavern_events.CHAT_CHANGED) {
             eventOn(tavern_events.CHAT_CHANGED, () => {
                 addLog('EVENT', 'CHAT_CHANGED');
-                // 切换角色后自动生成锚点（如果启用且无缓存）
-                if (settings.anchorConfig.enabled) {
+                // 切换角色/对话后，如果没有任何缓存则自动生成全部角色锚点
+                if (settings.anchorConfig.enabled && Object.keys(anchorCache).length === 0) {
                     setTimeout(async () => {
-                        const name = getCurrentCharacterName();
-                        if (name && !anchorCache[name]?.description) {
-                            addLog('ANCHOR', `新角色 "${name}"，自动生成锚点...`);
-                            await generateCharacterAnchor(name);
-                        }
+                        addLog('ANCHOR', '切换对话，自动生成全部角色锚点...');
+                        await generateAllCharacterAnchors();
                     }, 1500);
                 }
                 setTimeout(processChatDOM, 800);
@@ -1745,9 +1984,9 @@
         ]);
         eventOn(getButtonEvent(t('gen_anchor_btn')), async () => {
             if (typeof toastr !== 'undefined') toastr.info(t('anchor_generating'));
-            const anchor = await generateCharacterAnchor(null, true);
-            if (anchor) {
-                if (typeof toastr !== 'undefined') toastr.success(`✓ ${anchor.description.substring(0, 60)}...`);
+            const results = await generateAllCharacterAnchors(true);
+            if (results.length) {
+                if (typeof toastr !== 'undefined') toastr.success(`✓ 已生成 ${results.length} 个角色锚点`);
             } else {
                 if (typeof toastr !== 'undefined') toastr.warning('锚点生成失败（世界书为空或LLM调用失败）');
             }
