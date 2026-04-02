@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         生图助手 v2
-// @version      v2.2.6
+// @version      v2.2.7
 // @description  两步LLM串行生图：角色锚点(自然语言) + 场景描述，内置Z-Image ComfyUI工作流
 // @author       GenImage Helper
 // @match        */*
@@ -1332,16 +1332,19 @@
             const collectedUrls = [];
             await generateComfyUIImage(prompt, negative, async (url, idx, total) => {
                 collectedUrls.push(url);
-                await updateChatData(mesId, blockIdx, prompt, [...collectedUrls], false, false);
+                // silent=true：只持久化数据，不触发 ST 重渲染，wrapper 保持在 DOM 中
+                await updateChatData(mesId, blockIdx, prompt, [...collectedUrls], false, false, true);
                 updateWrapperView($wrap, [...collectedUrls], collectedUrls.length - 1);
                 showMsg(`${collectedUrls.length}/${total}`);
             });
+            // 兜底：若 wrapper 已被其他事件销毁，重新渲染 DOM
+            if (!$wrap.closest('body').length) setTimeout(processChatDOM, 300);
         } catch (e) {
             addLog('GEN', `失败: ${e.message}`);
             $placeholder.removeClass('requesting');
             $placeholder.find('.gi-ph-text').text(`❌ ${e.message.substring(0, 50)}`);
             showMsg('失败');
-            await updateChatData(mesId, blockIdx, prompt, [], true, false);
+            await updateChatData(mesId, blockIdx, prompt, [], true, false, true);
         }
     }
 
@@ -1365,7 +1368,8 @@
         }
     }
 
-    async function updateChatData(mesId, blockIdx, prompt, images, preventAuto, isScheduled) {
+    // silent=true: 只保存数据，不触发 ST 重渲染消息 DOM（防止 wrapper 被销毁）
+    async function updateChatData(mesId, blockIdx, prompt, images, preventAuto, isScheduled, silent = false) {
         const ctx = getSTContext();
         const chat = ctx?.chat;
         if (!chat?.[mesId]) return;
@@ -1381,7 +1385,7 @@
         });
         try {
             if (typeof ctx.saveChat === 'function') await ctx.saveChat();
-            if (ctx.eventSource) await ctx.eventSource.emit('message_updated', parseInt(mesId));
+            if (!silent && ctx.eventSource) await ctx.eventSource.emit('message_updated', parseInt(mesId));
         } catch (e) { addLog('CHAT', `保存失败: ${e.message}`); }
     }
 
@@ -1449,7 +1453,9 @@
                 const imgs = JSON.parse(decodeURIComponent($w.attr('data-images')||'[]'));
                 const content = decodeURIComponent($w.attr('data-prompt')||'');
                 if ($w.attr('data-scheduled')==='true' || $w.attr('data-prevent-auto')==='true' || imgs.length>0) return;
-                updateChatData(mesId, bIdx, content, [], false, true).then(() => {
+                // 用 silent=true，不触发 message_updated，避免 ST 重渲染消息销毁 wrapper
+                $w.attr('data-scheduled', 'true');
+                updateChatData(mesId, bIdx, content, [], false, true, true).then(() => {
                     setTimeout(() => handleGeneration({ $wrap:$w, mesId, blockIdx:bIdx, prompt:content }), 500 + bIdx*500);
                 });
             });
