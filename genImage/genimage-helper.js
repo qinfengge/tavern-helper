@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         生图助手 v2
-// @version      v2.2.4
+// @version      v2.2.5
 // @description  两步LLM串行生图：角色锚点(自然语言) + 场景描述，内置Z-Image ComfyUI工作流
 // @author       GenImage Helper
 // @match        */*
@@ -901,10 +901,10 @@
 
     // ========== COMFYUI ==========
 
-    // 内置 Z-Image Turbo 工作流（UNETLoader + DualCLIPLoader，适合 Z-Image/Flux 模型）
+    // 内置 Z-Image Turbo 工作流（UNETLoader + CLIPLoader with Qwen，适合 Z-Image 模型）
     const Z_IMAGE_WORKFLOW = {
         "1": { "class_type":"UNETLoader",      "inputs":{ "unet_name":"z-image-turbo.safetensors", "weight_dtype":"default" } },
-        "2": { "class_type":"DualCLIPLoader",  "inputs":{ "clip_name1":"clip_l.safetensors", "clip_name2":"t5xxl_fp8_e4m3fn.safetensors", "type":"flux" } },
+        "2": { "class_type":"CLIPLoader",      "inputs":{ "clip_name":"qwen_3_4b.safetensors", "type":"wan" } },
         "3": { "class_type":"CLIPTextEncode",  "inputs":{ "text":"", "clip":["2",0] } },
         "4": { "class_type":"CLIPTextEncode",  "inputs":{ "text":"", "clip":["2",0] } },
         "5": { "class_type":"EmptyLatentImage","inputs":{ "width":832, "height":1216, "batch_size":1 } },
