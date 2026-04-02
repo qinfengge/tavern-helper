@@ -14,14 +14,16 @@
     ]);
     const SCRIPT_INFO = [
         '酒馆助手脚本版生图大师。',
-        `入口按钮: ${APP_NAME} / ${MANUAL_PROMPT_BUTTON_NAME}`,
-        '如果没有看到按钮，请在“酒馆助手 -> 脚本库”确认脚本已启用且按钮已启用。'
+        '主入口: 左下角魔棒工具菜单',
+        `脚本按钮: ${APP_NAME} / ${MANUAL_PROMPT_BUTTON_NAME}`,
+        '如果没有看到入口，请确认脚本已启用，并检查酒馆助手菜单是否已加载。'
     ].join('\n');
     const runtime = globalThis[RUNTIME_KEY] && typeof globalThis[RUNTIME_KEY] === 'object'
         ? globalThis[RUNTIME_KEY]
-        : { actions: {}, boundEvents: new Set(), bootTimer: null };
+        : { actions: {}, boundEvents: new Set(), bootTimer: null, menuTimer: null };
     runtime.actions = runtime.actions && typeof runtime.actions === 'object' ? runtime.actions : {};
     runtime.boundEvents = runtime.boundEvents instanceof Set ? runtime.boundEvents : new Set();
+    runtime.menuTimer = runtime.menuTimer || null;
 
     const BUILTIN_WORKFLOWS = [
         {
@@ -794,15 +796,21 @@
         openPanel(defaultTab);
     }
 
+    function buildMenuItemHtml() {
+        return `
+            <div class="fa-fw fa-solid fa-paintbrush"></div>
+            <span>${APP_NAME}</span>
+        `;
+    }
+
     function ensureMenuItem() {
         if (typeof window.jQuery === 'function') {
             const $ = window.jQuery;
             if ($('#extensionsMenu').length === 0) return false;
             if (!$(`#${MENU_ID}`).length) {
                 const $item = $(
-                    `<div class="list-group-item flex-container flexGap5 interactable" id="${MENU_ID}">
-                        <div class="fa-fw fa-solid fa-wand-magic-sparkles"></div>
-                        <span>${APP_NAME}</span>
+                    `<div class="list-group-item flex-container flexGap5 interactable extensionsMenuExtensionButton" id="${MENU_ID}">
+                        ${buildMenuItemHtml()}
                     </div>`
                 );
                 $item.on('click', () => openFromMenu('basic'));
@@ -816,8 +824,8 @@
         if (!document.getElementById(MENU_ID)) {
             const item = document.createElement('div');
             item.id = MENU_ID;
-            item.className = 'list-group-item flex-container flexGap5 interactable';
-            item.innerHTML = `<div class="fa-fw fa-solid fa-wand-magic-sparkles"></div><span>${APP_NAME}</span>`;
+            item.className = 'list-group-item flex-container flexGap5 interactable extensionsMenuExtensionButton';
+            item.innerHTML = buildMenuItemHtml();
             item.addEventListener('click', () => openFromMenu('basic'));
             root.appendChild(item);
         }
@@ -948,12 +956,30 @@
         }
     }
 
+    function clearMenuTimer() {
+        if (runtime.menuTimer) {
+            clearInterval(runtime.menuTimer);
+            runtime.menuTimer = null;
+        }
+    }
+
+    function ensureMenuWatcher() {
+        ensureMenuItem();
+        if (runtime.menuTimer) {
+            return;
+        }
+
+        runtime.menuTimer = setInterval(() => {
+            ensureMenuItem();
+        }, 1500);
+    }
+
     function bootOnce() {
         syncScriptInfo();
         addStyle();
         const modal = ensureInteractiveModal();
         const buttonsReady = ensureScriptButtons();
-        ensureMenuItem();
+        ensureMenuWatcher();
         if (modal && buttonsReady) {
             return true;
         }
@@ -972,6 +998,7 @@
 
     function dispose() {
         clearBootTimer();
+        clearMenuTimer();
     }
 
     runtime.dispose = dispose;
