@@ -297,8 +297,7 @@
             activeWorkflow: 'Z-Image',
             savedWorkflows: {},
             paramOverrides: {
-                ckpt_name: '',       // CheckpointLoaderSimple 用（传统SD）
-                unet_name: '',       // UNETLoader 用（Z-Image / Flux）
+                model_name: '',      // 统一模型字段，自动写入 checkpoint 或 unet 节点
                 steps: 20,
                 cfg: 7,
                 width: 832,
@@ -969,11 +968,11 @@
             if (ov.width)  l.width  = ov.width;
             if (ov.height) l.height = ov.height;
         }
-        if (map.checkpoint_node && ov.ckpt_name) {
-            workflow[map.checkpoint_node].inputs.ckpt_name = ov.ckpt_name;
-        }
-        if (map.unet_node && ov.unet_name) {
-            workflow[map.unet_node].inputs.unet_name = ov.unet_name;
+        // 统一模型字段 — 写入工作流实际使用的节点类型
+        const modelName = ov.model_name || '';
+        if (modelName) {
+            if (map.checkpoint_node) workflow[map.checkpoint_node].inputs.ckpt_name = modelName;
+            if (map.unet_node)       workflow[map.unet_node].inputs.unet_name = modelName;
         }
 
         // LoRA 链式注入
@@ -1722,10 +1721,11 @@
             try {
                 const { checkpoints, unets } = await fetchComfyUIModels();
                 settings.comfyuiConfig.availableModels = { checkpoints, unets };
-                const curCkpt = settings.comfyuiConfig.paramOverrides?.ckpt_name || '';
-                const curUnet = settings.comfyuiConfig.paramOverrides?.unet_name || '';
-                $('#gi-ckpt').html(checkpoints.map(m => `<option value="${escapeAttr(m)}" ${m===curCkpt?'selected':''}>${escapeHtml(m)}</option>`).join('') || '<option value="">（无）</option>');
-                $('#gi-unet').html(unets.map(m => `<option value="${escapeAttr(m)}" ${m===curUnet?'selected':''}>${escapeHtml(m)}</option>`).join('') || '<option value="">（无）</option>');
+                const cur = settings.comfyuiConfig.paramOverrides?.model_name || '';
+                let html = '';
+                if (checkpoints.length) html += `<optgroup label="Checkpoint (SD/SDXL)">${checkpoints.map(m => `<option value="${escapeAttr(m)}" ${m===cur?'selected':''}>${escapeHtml(m)}</option>`).join('')}</optgroup>`;
+                if (unets.length)       html += `<optgroup label="UNET (Z-Image / Flux)">${unets.map(m => `<option value="${escapeAttr(m)}" ${m===cur?'selected':''}>${escapeHtml(m)}</option>`).join('')}</optgroup>`;
+                $('#gi-model').html(html || '<option value="">（未找到模型）</option>');
                 if (typeof toastr !== 'undefined') toastr.success(`Checkpoint: ${checkpoints.length}，UNET: ${unets.length}`);
             } catch (e) {
                 if (typeof toastr !== 'undefined') toastr.error(`获取模型失败: ${e.message}`);
@@ -1879,27 +1879,33 @@
         return settings.comfyuiConfig.savedWorkflows?.[wf]?.json || Z_IMAGE_WORKFLOW;
     }
 
-    function buildModelSelectHtml(id, list, cur) {
-        if (!list.length) {
-            const curOpt = cur ? `<option value="${escapeAttr(cur)}" selected>${escapeHtml(cur)}</option>` : '<option value="">（点击获取）</option>';
-            return `<select id="${id}" style="flex:1;">${curOpt}</select>`;
+    function buildModelSelectHtml() {
+        const am = settings.comfyuiConfig.availableModels || { checkpoints:[], unets:[] };
+        const cur = settings.comfyuiConfig.paramOverrides?.model_name || '';
+        const ckpts = am.checkpoints || [];
+        const unets = am.unets || [];
+        if (!ckpts.length && !unets.length) {
+            const curOpt = cur ? `<option value="${escapeAttr(cur)}" selected>${escapeHtml(cur)}</option>` : '<option value="">（点击"获取模型列表"）</option>';
+            return `<select id="gi-model" style="flex:1;">${curOpt}</select>`;
         }
-        const opts = list.map(m => `<option value="${escapeAttr(m)}" ${m===cur?'selected':''}>${escapeHtml(m)}</option>`).join('');
-        return `<select id="${id}" style="flex:1;">${opts}</select>`;
+        let html = '';
+        if (ckpts.length) {
+            html += `<optgroup label="Checkpoint (SD/SDXL)">${ckpts.map(m => `<option value="${escapeAttr(m)}" ${m===cur?'selected':''}>${escapeHtml(m)}</option>`).join('')}</optgroup>`;
+        }
+        if (unets.length) {
+            html += `<optgroup label="UNET (Z-Image / Flux)">${unets.map(m => `<option value="${escapeAttr(m)}" ${m===cur?'selected':''}>${escapeHtml(m)}</option>`).join('')}</optgroup>`;
+        }
+        return `<select id="gi-model" style="flex:1;">${html}</select>`;
     }
 
     function buildParamOverridesHtml() {
         const o = settings.comfyuiConfig.paramOverrides || {};
-        const am = settings.comfyuiConfig.availableModels || { checkpoints:[], unets:[] };
         const samplers = ['euler','euler_ancestral','heun','dpm_2','dpm_2_ancestral','dpmpp_2s_ancestral','dpmpp_sde','dpmpp_2m','ddim'];
         const scheds   = ['normal','karras','exponential','sgm_uniform','simple','ddim_uniform'];
         return `
-        <div class="gi-row"><label>Checkpoint 模型</label>
-            ${buildModelSelectHtml('gi-ckpt', am.checkpoints||[], o.ckpt_name||'')}
+        <div class="gi-row"><label>${t('model_name')}</label>
+            ${buildModelSelectHtml()}
             <button class="gi-btn gi-btn-sec gi-btn-sm" id="gi-fetch-models-comfy" style="margin-left:6px;flex-shrink:0;">${t('model_fetch')}</button>
-        </div>
-        <div class="gi-row"><label>UNET 模型<br><span style="font-size:0.75em;color:var(--nm-text-muted);">(Z-Image/Flux)</span></label>
-            ${buildModelSelectHtml('gi-unet', am.unets||[], o.unet_name||'')}
         </div>
         <div class="gi-row"><label>${t('width')} × ${t('height')}</label>
             <input type="number" id="gi-width"  value="${o.width||832}"  min="64" max="2048" step="64" style="max-width:90px;">
@@ -1929,23 +1935,15 @@
             if (l.width  !== undefined) $('#gi-width').val(l.width);
             if (l.height !== undefined) $('#gi-height').val(l.height);
         }
-        if (map.checkpoint_node) {
-            const ckpt = json[map.checkpoint_node]?.inputs?.ckpt_name || '';
-            if (ckpt) {
-                if (!$('#gi-ckpt').find(`option[value="${escapeAttr(ckpt)}"]`).length) {
-                    $('#gi-ckpt').prepend(`<option value="${escapeAttr(ckpt)}">${escapeHtml(ckpt)}</option>`);
-                }
-                $('#gi-ckpt').val(ckpt);
+        // 从 checkpoint 或 unet 节点读取当前模型名，回填到统一的 #gi-model
+        const modelFromWf = (map.checkpoint_node && json[map.checkpoint_node]?.inputs?.ckpt_name)
+            || (map.unet_node && json[map.unet_node]?.inputs?.unet_name)
+            || '';
+        if (modelFromWf) {
+            if (!$('#gi-model').find(`option[value="${escapeAttr(modelFromWf)}"]`).length) {
+                $('#gi-model').prepend(`<option value="${escapeAttr(modelFromWf)}">${escapeHtml(modelFromWf)}</option>`);
             }
-        }
-        if (map.unet_node) {
-            const unet = json[map.unet_node]?.inputs?.unet_name || '';
-            if (unet) {
-                if (!$('#gi-unet').find(`option[value="${escapeAttr(unet)}"]`).length) {
-                    $('#gi-unet').prepend(`<option value="${escapeAttr(unet)}">${escapeHtml(unet)}</option>`);
-                }
-                $('#gi-unet').val(unet);
-            }
+            $('#gi-model').val(modelFromWf);
         }
     }
 
@@ -2037,8 +2035,7 @@
         settings.comfyuiConfig.useHttps     = $('#gi-comfyui-https').is(':checked');
         settings.comfyuiConfig.activeWorkflow = $('#gi-workflow-select').val();
         settings.comfyuiConfig.paramOverrides = {
-            ckpt_name:   $('#gi-ckpt').val()?.trim() || '',
-            unet_name:   $('#gi-unet').val()?.trim() || '',
+            model_name:  $('#gi-model').val()?.trim() || '',
             steps:       parseInt($('#gi-steps').val()) || 20,
             cfg:         parseFloat($('#gi-cfg').val()) || 7,
             width:       parseInt($('#gi-width').val()) || 832,
