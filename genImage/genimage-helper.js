@@ -269,20 +269,25 @@
 
         sceneConfig: {
             historyCount: 4,
-            // 提示词：要求LLM输出Z-Image自然语言场景描述
-            template: `你是一个AI图像生成提示词专家，专门为Z-Image工作流生成自然语言场景描述。
+            // 提示词：要求LLM输出Z-Image自然语言场景描述（详细版）
+            template: `你是一个顶级AI图像生成提示词专家，专为Z-Image工作流（Flux/SD3类自然语言模型）创作高质量图像描述。
 
-规则：
-1. 使用完整的自然语言句子，不使用SD风格的关键词标签
-2. 必须包含角色锚点中的固定外貌描述（原样保留）
-3. 在固定外貌的基础上，追加当前场景的动作、表情、服装变化、环境、光线等
-4. 每个插入点只描述一个角色
-5. after_paragraph对应剧情中[P1][P2]...的段落编号
-6. 必须至少生成1个提示词
-7. 只输出JSON，不要任何其他内容
+核心规则：
+1. 使用流畅的自然语言段落，禁止使用逗号堆叠关键词
+2. 必须将角色锚点中的固定外貌描述原样融入（不可省略或改写）
+3. 每条提示词必须包含以下全部要素，形成完整的画面：
+   - 【人物】锚点外貌 + 当前表情/神态 + 当前姿势动作 + 服装细节（若有变化则更新）
+   - 【场景】具体环境（室内/室外、地点特征、细节布置）
+   - 【光线】光源类型、方向、色温（如正午阳光、夜间烛光、阴天漫射光）
+   - 【构图】景别（全身/半身/特写）、镜头角度（正面/侧面/俯视）
+   - 【氛围】整体情绪基调和画面风格感
+4. 提示词长度目标：120~250个词，不得少于80词
+5. after_paragraph 对应剧情段落编号 [P1][P2]...，选择情绪转折或视觉最丰富的位置
+6. 每次生成1~2个插入点（不要超过2个）
+7. 只输出纯JSON，不要解释或其他内容
 
-示例输出格式：
-{"insertions":[{"after_paragraph":1,"prompt":"A young woman with long silver hair and blue eyes, wearing a white dress, sitting by a sunlit window with a gentle smile, soft afternoon light filtering through the curtains, upper body view."}]}`
+输出格式：
+{"insertions":[{"after_paragraph":1,"prompt":"详细的完整场景描述..."}]}`
         },
 
         comfyuiConfig: {
@@ -939,7 +944,7 @@
         } else if (cfg.savedWorkflows?.[wf]?.json) {
             workflow = JSON.parse(JSON.stringify(cfg.savedWorkflows[wf].json));
         } else {
-            workflow = JSON.parse(JSON.stringify(Z_IMAGE_WORKFLOW));
+            throw new Error(`工作流 "${wf}" 未加载JSON，请在设置中重新获取或上传工作流文件`);
         }
 
         const map = autoMapNodes(workflow);
@@ -1034,18 +1039,51 @@
     }
 
     /**
-     * 从 ComfyUI 获取工作流列表 (需要 ComfyUI >= 0.2.x 的 /userdata 接口)
+     * 从 ComfyUI 下载单个工作流 JSON（API格式）
+     * ComfyUI 将用户数据文件通过 GET /userdata/{rel_path} 直接提供
+     */
+    async function fetchWorkflowJson(filename) {
+        const base = getComfyUIBaseUrl();
+        // filename 可能是 "test.json" 或 "subfolder/test.json"
+        const attempts = [
+            `${base}/userdata/workflows/${filename}`,
+            `${base}/userdata/${filename}`,
+        ];
+        for (const url of attempts) {
+            try {
+                const res = await safeFetch(url);
+                if (!res.ok) continue;
+                const json = await res.json();
+                // ComfyUI 工作流 JSON：节点以数字/字符串ID为键，每个节点有 class_type 字段
+                if (json && typeof json === 'object' && !Array.isArray(json)) return json;
+            } catch (_) {}
+        }
+        return null;
+    }
+
+    /**
+     * 从 ComfyUI 获取工作流列表并同时下载每个工作流的 JSON
+     * 返回 [{ name, path, json }]
      */
     async function fetchComfyUIWorkflows() {
         const res = await safeFetch(`${getComfyUIBaseUrl()}/userdata?dir=workflows&recurse=true`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        // data 可能是字符串数组或对象数组
         if (!Array.isArray(data)) throw new Error('格式不支持');
-        return data
+
+        const paths = data
             .map(x => (typeof x === 'string' ? x : x.path || x.name || ''))
             .filter(x => x.endsWith('.json'))
             .map(x => x.replace(/\\/g, '/'));
+
+        // 并发下载所有工作流的 JSON 内容
+        const results = await Promise.all(paths.map(async path => {
+            const name = path.split('/').pop().replace(/\.json$/i, '');
+            const json = await fetchWorkflowJson(path);
+            return { name, path, json };
+        }));
+
+        return results;
     }
 
     /**
@@ -1583,6 +1621,8 @@
         $('body').append(popup);
         renderActiveLoraList();
         renderAnchorTable();
+        // 初始化：从当前工作流填充参数字段
+        populateParamFieldsFromWorkflow(getCurrentWorkflowJson());
 
         // ---- Tab switching ----
         popup.on('click', '.gi-tab-btn', function () {
@@ -1676,33 +1716,44 @@
         // ---- Fetch ComfyUI workflows ----
         $('#gi-fetch-workflows').on('click', async function () {
             const btn = $(this).prop('disabled', true).text('获取中...');
+            $('#gi-workflow-fetch-status').text('正在获取并下载工作流...');
             settings.comfyuiConfig.host = $('#gi-comfyui-host').val();
             settings.comfyuiConfig.port = parseInt($('#gi-comfyui-port').val());
             try {
-                const files = await fetchComfyUIWorkflows();
-                if (!files.length) throw new Error('未找到工作流文件');
-                // 将工作流文件名作为选项追加到工作流列表
-                for (const path of files) {
-                    const name = path.split('/').pop().replace('.json', '');
-                    if (!settings.comfyuiConfig.savedWorkflows[name]) {
-                        // 占位：标记为从服务器获取（需要手动上传JSON才能使用）
-                        settings.comfyuiConfig.savedWorkflows[name] = { fromServer: true, path, json: null };
+                const items = await fetchComfyUIWorkflows();
+                if (!items.length) throw new Error('未找到工作流文件');
+                if (!settings.comfyuiConfig.savedWorkflows) settings.comfyuiConfig.savedWorkflows = {};
+                let loaded = 0;
+                for (const { name, path, json } of items) {
+                    // 已有手动上传的不覆盖
+                    const existing = settings.comfyuiConfig.savedWorkflows[name];
+                    if (!existing || existing.fromServer) {
+                        settings.comfyuiConfig.savedWorkflows[name] = { fromServer: true, path, json };
+                        if (json) loaded++;
                     }
                 }
                 $('#gi-workflow-select').html(buildWorkflowOptions());
-                $('#gi-workflow-fetch-status').text(`从服务器找到 ${files.length} 个工作流（需上传JSON才能使用）`);
-                if (typeof toastr !== 'undefined') toastr.success(`找到 ${files.length} 个工作流`);
+                const msg = `共 ${items.length} 个工作流，${loaded} 个已加载，${items.length - loaded} 个需手动上传JSON`;
+                $('#gi-workflow-fetch-status').text(msg);
+                if (typeof toastr !== 'undefined') toastr.success(`工作流已获取：${loaded}/${items.length}`);
             } catch (e) {
                 $('#gi-workflow-fetch-status').text(`✗ ${e.message}`);
+                if (typeof toastr !== 'undefined') toastr.error(`获取工作流失败: ${e.message}`);
             }
             btn.prop('disabled', false).text(t('fetch_workflows'));
         });
 
-        // ---- Workflow select change → update preview ----
+        // ---- Workflow select change → update preview + populate param fields ----
         $('#gi-workflow-select').on('change', function () {
             const wf = $(this).val();
             const json = wf === 'Z-Image' ? Z_IMAGE_WORKFLOW : settings.comfyuiConfig.savedWorkflows?.[wf]?.json;
+            if (!json) {
+                $('#gi-wf-preview').html(`<div style="color:#ff8080;font-size:0.82em;padding:8px;">⚠ 此工作流 JSON 未加载，请点击"从服务器获取"或手动上传 JSON 文件</div>`);
+                return;
+            }
             $('#gi-wf-preview').html(buildWorkflowPreviewHtml(json));
+            // 从工作流读取当前参数值，填入参数覆盖字段
+            populateParamFieldsFromWorkflow(json);
         });
 
         // ---- Upload workflow ----
@@ -1795,8 +1846,9 @@
     function buildWorkflowOptions() {
         const active = settings.comfyuiConfig.activeWorkflow || 'Z-Image';
         let opts = `<option value="Z-Image" ${active==='Z-Image'?'selected':''}>${t('workflow_builtin')}</option>`;
-        for (const name of Object.keys(settings.comfyuiConfig.savedWorkflows || {})) {
-            opts += `<option value="${escapeAttr(name)}" ${active===name?'selected':''}>${escapeHtml(name)}</option>`;
+        for (const [name, wf] of Object.entries(settings.comfyuiConfig.savedWorkflows || {})) {
+            const label = wf?.json ? escapeHtml(name) : `${escapeHtml(name)} (未加载)`;
+            opts += `<option value="${escapeAttr(name)}" ${active===name?'selected':''}>${label}</option>`;
         }
         return opts;
     }
@@ -1837,6 +1889,35 @@
         <div class="gi-row"><label>${t('sampler')}</label><select id="gi-sampler">${samplers.map(s=>`<option value="${s}" ${o.sampler_name===s?'selected':''}>${s}</option>`).join('')}</select></div>
         <div class="gi-row"><label>${t('scheduler')}</label><select id="gi-scheduler">${scheds.map(s=>`<option value="${s}" ${o.scheduler===s?'selected':''}>${s}</option>`).join('')}</select></div>
         <div class="gi-row"><label>${t('seed')}</label><input type="number" id="gi-seed" value="${o.seed??-1}" min="-1"></div>`;
+    }
+
+    /** 切换工作流时，将工作流内的实际参数值回填到参数覆盖输入框 */
+    function populateParamFieldsFromWorkflow(json) {
+        if (!json) return;
+        const map = autoMapNodes(json);
+        if (map.sampler_node) {
+            const s = json[map.sampler_node]?.inputs || {};
+            if (s.steps     !== undefined) $('#gi-steps').val(s.steps);
+            if (s.cfg       !== undefined) $('#gi-cfg').val(s.cfg);
+            if (s.seed      !== undefined) $('#gi-seed').val(s.seed < 0 ? -1 : s.seed);
+            if (s.sampler_name) $('#gi-sampler').val(s.sampler_name);
+            if (s.scheduler)   $('#gi-scheduler').val(s.scheduler);
+        }
+        if (map.latent_node) {
+            const l = json[map.latent_node]?.inputs || {};
+            if (l.width  !== undefined) $('#gi-width').val(l.width);
+            if (l.height !== undefined) $('#gi-height').val(l.height);
+        }
+        if (map.checkpoint_node) {
+            const ckpt = json[map.checkpoint_node]?.inputs?.ckpt_name || '';
+            if (ckpt) {
+                // 如果 select 里没有该选项，追加一个
+                if (!$('#gi-ckpt').find(`option[value="${escapeAttr(ckpt)}"]`).length) {
+                    $('#gi-ckpt').prepend(`<option value="${escapeAttr(ckpt)}">${escapeHtml(ckpt)}</option>`);
+                }
+                $('#gi-ckpt').val(ckpt);
+            }
+        }
     }
 
     function renderAnchorTable() {
