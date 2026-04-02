@@ -1,0 +1,22 @@
+{
+  "type": "script",
+  "enabled": true,
+  "name": "生图大师",
+  "id": "b354d35f-8b11-4f78-a7d7-0fd2df8a6c61",
+  "content": "import 'https://your-cdn.example.com/gen-master.js'",
+  "info": "酒馆助手脚本版生图大师。支持自定义 LLM、角色/场景总结、ComfyUI 工作流与生图。",
+  "button": {
+    "enabled": true,
+    "buttons": [
+      {
+        "name": "生图大师",
+        "visible": true
+      },
+      {
+        "name": "手动生词",
+        "visible": true
+      }
+    ]
+  },
+  "data": {}
+}
