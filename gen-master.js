@@ -20,10 +20,11 @@
     ].join('\n');
     const runtime = globalThis[RUNTIME_KEY] && typeof globalThis[RUNTIME_KEY] === 'object'
         ? globalThis[RUNTIME_KEY]
-        : { actions: {}, boundEvents: new Set(), bootTimer: null, menuTimer: null };
+        : { actions: {}, boundEvents: new Set(), bootTimer: null, menuTimer: null, buttonTimer: null };
     runtime.actions = runtime.actions && typeof runtime.actions === 'object' ? runtime.actions : {};
     runtime.boundEvents = runtime.boundEvents instanceof Set ? runtime.boundEvents : new Set();
     runtime.menuTimer = runtime.menuTimer || null;
+    runtime.buttonTimer = runtime.buttonTimer || null;
 
     const BUILTIN_WORKFLOWS = [
         {
@@ -257,6 +258,8 @@
             #${MODAL_ID} .gm-caption{margin-top:14px;padding:12px 14px;border-radius:16px;background:rgba(255,255,255,.04);color:#a7a6bd;line-height:1.65;word-break:break-word}
             #${MODAL_ID} .gm-muted{color:#9c9bb3;font-size:13px}
             @media (max-width: 900px){#${MODAL_ID} .gm-tabs,#${MODAL_ID} .gm-grid,#${MODAL_ID} .gm-mini{grid-template-columns:1fr}#${MODAL_ID} .gm-head{flex-direction:column}}
+            #extensionsMenu #${MENU_ID}{display:flex !important;align-items:center !important;gap:10px !important;width:100%;white-space:nowrap;writing-mode:horizontal-tb;text-orientation:mixed}
+            #extensionsMenu #${MENU_ID} span{display:inline-block;white-space:nowrap;writing-mode:horizontal-tb;text-orientation:mixed}
         `;
         document.head.appendChild(style);
     }
@@ -793,7 +796,52 @@
         if (options) {
             options.style.display = 'none';
         }
+        const extensionsMenu = document.getElementById('extensionsMenu');
+        if (extensionsMenu) {
+            extensionsMenu.style.display = 'none';
+        }
         openPanel(defaultTab);
+    }
+
+    async function runMainEntry() {
+        openFromMenu('basic');
+    }
+
+    async function runManualPromptEntry() {
+        try {
+            openFromMenu('prompt');
+            setStatus('处理中...');
+            await buildCharacterAnchor();
+            await buildSceneSummary();
+            await composePrompt();
+        } catch (error) {
+            const message = normalizeError(error);
+            setStatus(message, true);
+            toast('error', message);
+        }
+    }
+
+    function bindDomAction(element, actionKey, handler) {
+        if (!element) {
+            return false;
+        }
+
+        const bindKey = `gmBound${actionKey}`;
+        if (element.dataset?.[bindKey]) {
+            return true;
+        }
+
+        element.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            handler();
+        });
+
+        if (element.dataset) {
+            element.dataset[bindKey] = 'true';
+        }
+
+        return true;
     }
 
     function buildMenuItemHtml() {
@@ -813,9 +861,9 @@
                         ${buildMenuItemHtml()}
                     </div>`
                 );
-                $item.on('click', () => openFromMenu('basic'));
                 $('#extensionsMenu').append($item);
             }
+            bindDomAction(document.getElementById(MENU_ID), 'menuEntry', runMainEntry);
             return true;
         }
 
@@ -826,9 +874,9 @@
             item.id = MENU_ID;
             item.className = 'list-group-item flex-container flexGap5 interactable extensionsMenuExtensionButton';
             item.innerHTML = buildMenuItemHtml();
-            item.addEventListener('click', () => openFromMenu('basic'));
             root.appendChild(item);
         }
+        bindDomAction(document.getElementById(MENU_ID), 'menuEntry', runMainEntry);
         return true;
     }
 
@@ -927,26 +975,54 @@
         }
     }
 
-    function ensureScriptButtons() {
-        appendScriptButtons();
-        const mainBound = bindScriptButton(APP_NAME, 'open-panel', async () => {
-            openFromMenu('basic');
+    function findLabelledActionElements(label) {
+        const matches = [];
+        const selector = 'button, a, div, span';
+        document.querySelectorAll(selector).forEach(element => {
+            if (element.id === MENU_ID || element.closest(`#${MENU_ID}`)) {
+                return;
+            }
+
+            const text = String(element.textContent || '').replace(/\s+/g, ' ').trim();
+            if (text !== label) {
+                return;
+            }
+
+            if (element.children.length > 0 && text !== label) {
+                return;
+            }
+
+            matches.push(element);
         });
-        const manualBound = bindScriptButton(MANUAL_PROMPT_BUTTON_NAME, 'manual-prompt', async () => {
-            try {
-                openFromMenu('prompt');
-                setStatus('处理中...');
-                await buildCharacterAnchor();
-                await buildSceneSummary();
-                await composePrompt();
-            } catch (error) {
-                const message = normalizeError(error);
-                setStatus(message, true);
-                toast('error', message);
+
+        return matches;
+    }
+
+    function ensureDomButtons() {
+        let bound = false;
+
+        findLabelledActionElements(APP_NAME).forEach(element => {
+            if (bindDomAction(element, 'mainButton', runMainEntry)) {
+                bound = true;
             }
         });
 
-        return mainBound && manualBound;
+        findLabelledActionElements(MANUAL_PROMPT_BUTTON_NAME).forEach(element => {
+            if (bindDomAction(element, 'manualButton', runManualPromptEntry)) {
+                bound = true;
+            }
+        });
+
+        return bound;
+    }
+
+    function ensureScriptButtons() {
+        appendScriptButtons();
+        const mainBound = bindScriptButton(APP_NAME, 'open-panel', runMainEntry);
+        const manualBound = bindScriptButton(MANUAL_PROMPT_BUTTON_NAME, 'manual-prompt', runManualPromptEntry);
+        const domButtonsBound = ensureDomButtons();
+
+        return (mainBound && manualBound) || domButtonsBound;
     }
 
     function clearBootTimer() {
@@ -963,6 +1039,13 @@
         }
     }
 
+    function clearButtonTimer() {
+        if (runtime.buttonTimer) {
+            clearInterval(runtime.buttonTimer);
+            runtime.buttonTimer = null;
+        }
+    }
+
     function ensureMenuWatcher() {
         ensureMenuItem();
         if (runtime.menuTimer) {
@@ -974,12 +1057,24 @@
         }, 1500);
     }
 
+    function ensureButtonWatcher() {
+        ensureDomButtons();
+        if (runtime.buttonTimer) {
+            return;
+        }
+
+        runtime.buttonTimer = setInterval(() => {
+            ensureDomButtons();
+        }, 1500);
+    }
+
     function bootOnce() {
         syncScriptInfo();
         addStyle();
         const modal = ensureInteractiveModal();
         const buttonsReady = ensureScriptButtons();
         ensureMenuWatcher();
+        ensureButtonWatcher();
         if (modal && buttonsReady) {
             return true;
         }
@@ -999,6 +1094,7 @@
     function dispose() {
         clearBootTimer();
         clearMenuTimer();
+        clearButtonTimer();
     }
 
     runtime.dispose = dispose;
