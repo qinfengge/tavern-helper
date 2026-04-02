@@ -54,6 +54,7 @@
     // ========== CONSTANTS ==========
     const SCRIPT_ID = 'genimage_helper_v2';
     const STORAGE_KEY = 'genimage_helper_settings';
+    const ANCHOR_CACHE_KEY = 'genimage_anchor_cache';
     const START_TAG = '[IMG_GEN]';
     const END_TAG = '[/IMG_GEN]';
     const NO_GEN_FLAG = '[no_gen]';
@@ -296,7 +297,7 @@
 
     // ========== RUNTIME STATE ==========
     let settings = {};
-    let anchorCache = {};       // { charName: { hash, anchor: { character_name, description } } }
+    let anchorCache = {};       // { charName: { anchor: { character_name, description } } } — persistent, generate once
     let scheduledTimeoutMap = new Map();
 
     // ========== CSS ==========
@@ -473,7 +474,18 @@
         }
         // availableLoras 不持久化
         settings.comfyuiConfig.availableLoras = [];
+        // 加载锚点缓存（独立存储，持久化）
+        try {
+            const rawAnchor = localStorage.getItem(ANCHOR_CACHE_KEY);
+            if (rawAnchor) anchorCache = JSON.parse(rawAnchor);
+        } catch (_) {}
         addLog('SETTINGS', '设置已加载');
+    }
+
+    function saveAnchorCache() {
+        try {
+            localStorage.setItem(ANCHOR_CACHE_KEY, JSON.stringify(anchorCache));
+        } catch (e) { addLog('ANCHOR', `缓存保存失败: ${e.message}`); }
     }
 
     function saveSettings() {
@@ -599,66 +611,70 @@
         } catch (_) { return ''; }
     }
 
-    function getCurrentCharacterDescription() {
+    /**
+     * 自动读取当前角色绑定的所有世界书条目（primary + additional），无需手动选择
+     */
+    async function getAllCharacterWorldbookContent() {
+        const TH = window.TavernHelper || window.parent?.TavernHelper;
+        if (!TH?.getCharLorebooks) {
+            addLog('WORLDBOOK', 'TavernHelper.getCharLorebooks 不可用');
+            return '';
+        }
         try {
-            const ctx = getSTContext();
-            if (!ctx) return '';
-            const chid = ctx.this_chid ?? ctx.characterId;
-            if (chid === undefined || chid === null) return '';
-            const ch = ctx.characters?.[chid];
-            return [ch?.description, ch?.personality, ch?.scenario].filter(Boolean).join('\n\n');
-        } catch (_) { return ''; }
-    }
-
-    async function getSelectedWorldbookContent() {
-        const charName = getCurrentCharacterName();
-        const selections = settings.worldbookSelections?.[charName] || {};
-        const parts = [];
-        try {
-            const TH = window.TavernHelper || window.parent?.TavernHelper;
-            for (const [bookName, uids] of Object.entries(selections)) {
-                if (!uids?.length) continue;
-                const entries = TH?.getLorebookEntries ? await TH.getLorebookEntries(bookName) : [];
+            const lorebooks = await TH.getCharLorebooks({ type: 'all' });
+            // lorebooks = { primary: "bookname", additional: ["book1", ...] }
+            const bookNames = [];
+            if (lorebooks?.primary) bookNames.push(lorebooks.primary);
+            if (lorebooks?.additional?.length) bookNames.push(...lorebooks.additional);
+            if (!bookNames.length) {
+                addLog('WORLDBOOK', '当前角色未绑定任何世界书');
+                return '';
+            }
+            const parts = [];
+            for (const bookName of bookNames) {
+                const entries = await TH.getLorebookEntries(bookName);
                 for (const entry of (entries || [])) {
-                    if (uids.includes(entry.uid) && entry.content) {
-                        parts.push(`[${entry.comment || entry.key || bookName}]\n${entry.content}`);
+                    if (entry.content?.trim()) {
+                        const title = entry.comment || entry.name || `条目${entry.uid}`;
+                        parts.push(`【${title}】\n${entry.content.trim()}`);
                     }
                 }
             }
-        } catch (e) { addLog('WORLDBOOK', `读取失败: ${e.message}`); }
-        return parts.join('\n\n');
+            addLog('WORLDBOOK', `已读取 ${bookNames.length} 本世界书，${parts.length} 条条目`);
+            return parts.join('\n\n');
+        } catch (e) {
+            addLog('WORLDBOOK', `读取失败: ${e.message}`);
+            return '';
+        }
     }
 
     /**
      * Step 1: 生成角色锚点（自然语言外貌描述，Z-Image格式）
-     * 绑定角色卡，按内容hash缓存
+     * - 从世界书自动读取，不依赖角色卡描述
+     * - 按角色名永久缓存（只生成一次），forceRefresh=true 时强制重新生成
+     * - 支持多角色，每个角色独立缓存
      */
-    async function generateCharacterAnchor(forceRefresh = false) {
+    async function generateCharacterAnchor(charName, forceRefresh = false) {
         if (!settings.anchorConfig.enabled) return null;
 
-        const charName = getCurrentCharacterName();
+        charName = charName || getCurrentCharacterName();
         if (!charName) { addLog('ANCHOR', '未找到当前角色'); return null; }
 
-        const charDesc = getCurrentCharacterDescription();
-        const wbContent = await getSelectedWorldbookContent();
-        const sourceHash = simpleHash(charDesc + wbContent);
-
-        // 缓存命中
-        if (!forceRefresh && settings.anchorConfig.cacheEnabled
-            && anchorCache[charName]?.hash === sourceHash
-            && anchorCache[charName]?.anchor?.description) {
+        // 永久缓存命中：只要存在就不重新生成（除非强制刷新）
+        if (!forceRefresh && anchorCache[charName]?.description) {
             addLog('ANCHOR', `命中缓存: ${charName}`);
-            return anchorCache[charName].anchor;
+            return anchorCache[charName];
         }
 
-        if (!charDesc && !wbContent) {
-            addLog('ANCHOR', '角色卡描述为空，跳过锚点生成');
+        const wbContent = await getAllCharacterWorldbookContent();
+        if (!wbContent.trim()) {
+            addLog('ANCHOR', `${charName}: 世界书为空，无法生成锚点`);
             return null;
         }
 
         addLog('ANCHOR', `生成角色锚点: ${charName}`);
 
-        const userContent = `角色名: ${charName}\n\n角色卡描述:\n${charDesc || '（无）'}\n\n世界书资料:\n${wbContent || '（无）'}`;
+        const userContent = `角色名: ${charName}\n\n世界书资料:\n${wbContent}`;
         const messages = [
             { role:'system', content: settings.anchorConfig.template },
             { role:'user',   content: userContent }
@@ -673,7 +689,9 @@
                 character_name: parsed.character_name || charName,
                 description: parsed.description.trim()
             };
-            anchorCache[charName] = { hash: sourceHash, anchor };
+            // 存入缓存并持久化
+            anchorCache[charName] = anchor;
+            saveAnchorCache();
             addLog('ANCHOR', `锚点生成成功: ${anchor.description.substring(0, 80)}...`);
             return anchor;
         } catch (e) {
@@ -1034,10 +1052,12 @@
         const messageText = msg.mes || '';
         if (messageText.includes(START_TAG)) return;
 
-        addLog('AUTO', `自动生图 mesId=${mesId}`);
+        // 取消息发送方名字（多角色支持）
+        const senderName = msg.name || getCurrentCharacterName();
+        addLog('AUTO', `自动生图 mesId=${mesId} sender=${senderName}`);
         try {
             if (typeof toastr !== 'undefined') toastr.info(t('anchor_generating'), null, { timeOut:3000 });
-            const anchor = await generateCharacterAnchor();
+            const anchor = await generateCharacterAnchor(senderName);
 
             if (typeof toastr !== 'undefined') toastr.info(t('scene_generating'), null, { timeOut:3000 });
             const { insertions, paragraphs } = await generateSceneDescription(mesId, messageText, anchor);
@@ -1265,7 +1285,7 @@
         if (settingsOpen) { closeSettingsPopup(); return; }
         settingsOpen = true;
 
-        const curAnchor = anchorCache[getCurrentCharacterName()]?.anchor;
+        const curAnchor = anchorCache[getCurrentCharacterName()];
 
         const popup = $(`
         <div id="gi-settings-overlay" style="position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:99998;display:flex;align-items:center;justify-content:center;">
@@ -1470,12 +1490,12 @@
         $('#gi-gen-anchor').on('click', async function () {
             const btn = $(this).prop('disabled', true).text(t('anchor_generating'));
             try {
-                const anchor = await generateCharacterAnchor(true);
+                const anchor = await generateCharacterAnchor(null, true);
                 if (anchor) {
                     $('#gi-anchor-preview').html(`<div class="gi-anchor-name">角色: ${escapeHtml(anchor.character_name)}</div><div class="gi-anchor-desc">${escapeHtml(anchor.description)}</div>`);
                     $('#gi-anchor-status').text('✓ 生成成功');
                 } else {
-                    $('#gi-anchor-status').text('✗ 生成失败（角色卡描述可能为空）');
+                    $('#gi-anchor-status').text('✗ 生成失败（世界书为空或LLM调用失败）');
                 }
             } catch (e) { $('#gi-anchor-status').text(`✗ ${e.message}`); }
             btn.prop('disabled', false).text(t('gen_anchor'));
@@ -1483,6 +1503,7 @@
 
         $('#gi-clear-anchor').on('click', function () {
             anchorCache = {};
+            saveAnchorCache();
             $('#gi-anchor-preview').html(`<div class="gi-anchor-desc" style="color:var(--nm-text-muted);font-style:normal;">${t('anchor_empty')}</div>`);
             $('#gi-anchor-status').text('✓ 缓存已清除');
         });
@@ -1701,9 +1722,9 @@
                 if (settings.anchorConfig.enabled) {
                     setTimeout(async () => {
                         const name = getCurrentCharacterName();
-                        if (name && !anchorCache[name]?.anchor?.description) {
+                        if (name && !anchorCache[name]?.description) {
                             addLog('ANCHOR', `新角色 "${name}"，自动生成锚点...`);
-                            await generateCharacterAnchor();
+                            await generateCharacterAnchor(name);
                         }
                     }, 1500);
                 }
@@ -1724,11 +1745,11 @@
         ]);
         eventOn(getButtonEvent(t('gen_anchor_btn')), async () => {
             if (typeof toastr !== 'undefined') toastr.info(t('anchor_generating'));
-            const anchor = await generateCharacterAnchor(true);
+            const anchor = await generateCharacterAnchor(null, true);
             if (anchor) {
                 if (typeof toastr !== 'undefined') toastr.success(`✓ ${anchor.description.substring(0, 60)}...`);
             } else {
-                if (typeof toastr !== 'undefined') toastr.warning('锚点生成为空（角色卡描述可能为空）');
+                if (typeof toastr !== 'undefined') toastr.warning('锚点生成失败（世界书为空或LLM调用失败）');
             }
         });
         eventOn(getButtonEvent(t('manual_gen')), async () => {
