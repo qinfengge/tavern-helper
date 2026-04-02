@@ -297,7 +297,8 @@
             activeWorkflow: 'Z-Image',
             savedWorkflows: {},
             paramOverrides: {
-                ckpt_name: '',
+                ckpt_name: '',       // CheckpointLoaderSimple 用（传统SD）
+                unet_name: '',       // UNETLoader 用（Z-Image / Flux）
                 steps: 20,
                 cfg: 7,
                 width: 832,
@@ -308,7 +309,7 @@
             },
             loras: [],               // [{ name, strength }]
             availableLoras: [],      // 从ComfyUI获取的可用LoRA列表（仅运行时）
-            availableModels: [],     // 从ComfyUI获取的可用模型列表（仅运行时）
+            availableModels: { checkpoints: [], unets: [] }, // 从ComfyUI获取（仅运行时）
         },
 
         promptConfig: {
@@ -506,8 +507,9 @@
             settings = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
             addLog('SETTINGS', `加载失败，使用默认: ${e.message}`);
         }
-        // availableLoras 不持久化
+        // 运行时列表不持久化
         settings.comfyuiConfig.availableLoras = [];
+        settings.comfyuiConfig.availableModels = { checkpoints: [], unets: [] };
         // 加载锚点缓存（独立存储，持久化）
         try {
             const rawAnchor = localStorage.getItem(ANCHOR_CACHE_KEY);
@@ -917,7 +919,7 @@
     }
 
     function autoMapNodes(workflow) {
-        const map = { positive_node:null, negative_node:null, sampler_node:null, latent_node:null, checkpoint_node:null, lora_nodes:[] };
+        const map = { positive_node:null, negative_node:null, sampler_node:null, latent_node:null, checkpoint_node:null, unet_node:null, lora_nodes:[] };
         for (const [id, node] of Object.entries(workflow)) {
             if (node.class_type === 'KSampler' || node.class_type === 'KSamplerAdvanced') {
                 map.sampler_node = id;
@@ -927,6 +929,7 @@
             }
             if (/EmptyLatentImage|EmptySD3LatentImage|EmptyHunyuanLatentVideo/.test(node.class_type)) map.latent_node = id;
             if (/CheckpointLoaderSimple|CheckpointLoader/.test(node.class_type)) map.checkpoint_node = id;
+            if (/UNETLoader/.test(node.class_type)) map.unet_node = id;
             if (/LoraLoader|LoRALoader/.test(node.class_type)) map.lora_nodes.push(id);
         }
         return map;
@@ -969,6 +972,9 @@
         if (map.checkpoint_node && ov.ckpt_name) {
             workflow[map.checkpoint_node].inputs.ckpt_name = ov.ckpt_name;
         }
+        if (map.unet_node && ov.unet_name) {
+            workflow[map.unet_node].inputs.unet_name = ov.unet_name;
+        }
 
         // LoRA 链式注入
         if (loras.length > 0 && map.checkpoint_node && map.sampler_node) {
@@ -1001,7 +1007,8 @@
             else {
                 const inp = node.inputs || {};
                 const show = [];
-                if (inp.ckpt_name) show.push(`ckpt=${inp.ckpt_name}`);
+                if (inp.ckpt_name)  show.push(`ckpt=${inp.ckpt_name}`);
+                if (inp.unet_name)  show.push(`unet=${inp.unet_name}`);
                 if (inp.steps !== undefined) show.push(`steps=${inp.steps}`);
                 if (inp.cfg   !== undefined) show.push(`cfg=${inp.cfg}`);
                 if (inp.width !== undefined) show.push(`${inp.width}×${inp.height}`);
@@ -1030,12 +1037,23 @@
      * 从 ComfyUI 获取可用模型（Checkpoint）列表
      */
     async function fetchComfyUIModels() {
-        const res = await safeFetch(`${getComfyUIBaseUrl()}/object_info/CheckpointLoaderSimple`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        const modelList = data?.CheckpointLoaderSimple?.input?.required?.ckpt_name?.[0];
-        if (!Array.isArray(modelList)) throw new Error('未找到模型列表');
-        return modelList.filter(Boolean);
+        const base = getComfyUIBaseUrl();
+        // 并发获取 Checkpoint 和 UNET 两种模型列表
+        const [ckptRes, unetRes] = await Promise.all([
+            safeFetch(`${base}/object_info/CheckpointLoaderSimple`).catch(() => null),
+            safeFetch(`${base}/object_info/UNETLoader`).catch(() => null),
+        ]);
+        const checkpoints = (ckptRes?.ok
+            ? (await ckptRes.json().catch(() => {}))?.CheckpointLoaderSimple?.input?.required?.ckpt_name?.[0]
+            : null) || [];
+        const unets = (unetRes?.ok
+            ? (await unetRes.json().catch(() => {}))?.UNETLoader?.input?.required?.unet_name?.[0]
+            : null) || [];
+        if (!checkpoints.length && !unets.length) throw new Error('未找到任何模型');
+        return {
+            checkpoints: checkpoints.filter(Boolean),
+            unets: unets.filter(Boolean),
+        };
     }
 
     /**
@@ -1044,10 +1062,11 @@
      */
     async function fetchWorkflowJson(filename) {
         const base = getComfyUIBaseUrl();
-        // filename 可能是 "test.json" 或 "subfolder/test.json"
+        // ComfyUI 要求路径中的 "/" 也要编码为 "%2F"，整条路径作为单个路由参数
+        const encodedPath = `workflows%2F${encodeURIComponent(filename)}`;
         const attempts = [
-            `${base}/userdata/workflows/${filename}`,
-            `${base}/userdata/${filename}`,
+            `${base}/userdata/${encodedPath}`,
+            `${base}/userdata/workflows/${encodeURIComponent(filename)}`,
         ];
         for (const url of attempts) {
             try {
@@ -1695,18 +1714,19 @@
             $('#gi-anchor-status').text('✓ 缓存已清除');
         });
 
-        // ---- Fetch ComfyUI models ----
+        // ---- Fetch ComfyUI models (Checkpoint + UNET) ----
         $('#gi-fetch-models-comfy').on('click', async function () {
             const btn = $(this).prop('disabled', true).text('获取中...');
             settings.comfyuiConfig.host = $('#gi-comfyui-host').val();
             settings.comfyuiConfig.port = parseInt($('#gi-comfyui-port').val());
             try {
-                const models = await fetchComfyUIModels();
-                settings.comfyuiConfig.availableModels = models;
-                const cur = settings.comfyuiConfig.paramOverrides?.ckpt_name || '';
-                const opts = models.map(m => `<option value="${escapeAttr(m)}" ${m===cur?'selected':''}>${escapeHtml(m)}</option>`).join('');
-                $('#gi-ckpt').html(opts);
-                if (typeof toastr !== 'undefined') toastr.success(`获取到 ${models.length} 个模型`);
+                const { checkpoints, unets } = await fetchComfyUIModels();
+                settings.comfyuiConfig.availableModels = { checkpoints, unets };
+                const curCkpt = settings.comfyuiConfig.paramOverrides?.ckpt_name || '';
+                const curUnet = settings.comfyuiConfig.paramOverrides?.unet_name || '';
+                $('#gi-ckpt').html(checkpoints.map(m => `<option value="${escapeAttr(m)}" ${m===curCkpt?'selected':''}>${escapeHtml(m)}</option>`).join('') || '<option value="">（无）</option>');
+                $('#gi-unet').html(unets.map(m => `<option value="${escapeAttr(m)}" ${m===curUnet?'selected':''}>${escapeHtml(m)}</option>`).join('') || '<option value="">（无）</option>');
+                if (typeof toastr !== 'undefined') toastr.success(`Checkpoint: ${checkpoints.length}，UNET: ${unets.length}`);
             } catch (e) {
                 if (typeof toastr !== 'undefined') toastr.error(`获取模型失败: ${e.message}`);
             }
@@ -1859,26 +1879,27 @@
         return settings.comfyuiConfig.savedWorkflows?.[wf]?.json || Z_IMAGE_WORKFLOW;
     }
 
-    function buildModelSelectHtml() {
-        const cfg = settings.comfyuiConfig;
-        const models = cfg.availableModels || [];
-        const cur = cfg.paramOverrides?.ckpt_name || '';
-        if (!models.length) {
+    function buildModelSelectHtml(id, list, cur) {
+        if (!list.length) {
             const curOpt = cur ? `<option value="${escapeAttr(cur)}" selected>${escapeHtml(cur)}</option>` : '<option value="">（点击获取）</option>';
-            return `<select id="gi-ckpt" style="flex:1;">${curOpt}</select>`;
+            return `<select id="${id}" style="flex:1;">${curOpt}</select>`;
         }
-        const opts = models.map(m => `<option value="${escapeAttr(m)}" ${m===cur?'selected':''}>${escapeHtml(m)}</option>`).join('');
-        return `<select id="gi-ckpt" style="flex:1;">${opts}</select>`;
+        const opts = list.map(m => `<option value="${escapeAttr(m)}" ${m===cur?'selected':''}>${escapeHtml(m)}</option>`).join('');
+        return `<select id="${id}" style="flex:1;">${opts}</select>`;
     }
 
     function buildParamOverridesHtml() {
         const o = settings.comfyuiConfig.paramOverrides || {};
+        const am = settings.comfyuiConfig.availableModels || { checkpoints:[], unets:[] };
         const samplers = ['euler','euler_ancestral','heun','dpm_2','dpm_2_ancestral','dpmpp_2s_ancestral','dpmpp_sde','dpmpp_2m','ddim'];
         const scheds   = ['normal','karras','exponential','sgm_uniform','simple','ddim_uniform'];
         return `
-        <div class="gi-row"><label>${t('model_name')}</label>
-            ${buildModelSelectHtml()}
+        <div class="gi-row"><label>Checkpoint 模型</label>
+            ${buildModelSelectHtml('gi-ckpt', am.checkpoints||[], o.ckpt_name||'')}
             <button class="gi-btn gi-btn-sec gi-btn-sm" id="gi-fetch-models-comfy" style="margin-left:6px;flex-shrink:0;">${t('model_fetch')}</button>
+        </div>
+        <div class="gi-row"><label>UNET 模型<br><span style="font-size:0.75em;color:var(--nm-text-muted);">(Z-Image/Flux)</span></label>
+            ${buildModelSelectHtml('gi-unet', am.unets||[], o.unet_name||'')}
         </div>
         <div class="gi-row"><label>${t('width')} × ${t('height')}</label>
             <input type="number" id="gi-width"  value="${o.width||832}"  min="64" max="2048" step="64" style="max-width:90px;">
@@ -1911,11 +1932,19 @@
         if (map.checkpoint_node) {
             const ckpt = json[map.checkpoint_node]?.inputs?.ckpt_name || '';
             if (ckpt) {
-                // 如果 select 里没有该选项，追加一个
                 if (!$('#gi-ckpt').find(`option[value="${escapeAttr(ckpt)}"]`).length) {
                     $('#gi-ckpt').prepend(`<option value="${escapeAttr(ckpt)}">${escapeHtml(ckpt)}</option>`);
                 }
                 $('#gi-ckpt').val(ckpt);
+            }
+        }
+        if (map.unet_node) {
+            const unet = json[map.unet_node]?.inputs?.unet_name || '';
+            if (unet) {
+                if (!$('#gi-unet').find(`option[value="${escapeAttr(unet)}"]`).length) {
+                    $('#gi-unet').prepend(`<option value="${escapeAttr(unet)}">${escapeHtml(unet)}</option>`);
+                }
+                $('#gi-unet').val(unet);
             }
         }
     }
@@ -2008,7 +2037,8 @@
         settings.comfyuiConfig.useHttps     = $('#gi-comfyui-https').is(':checked');
         settings.comfyuiConfig.activeWorkflow = $('#gi-workflow-select').val();
         settings.comfyuiConfig.paramOverrides = {
-            ckpt_name:   $('#gi-ckpt').val().trim(),
+            ckpt_name:   $('#gi-ckpt').val()?.trim() || '',
+            unet_name:   $('#gi-unet').val()?.trim() || '',
             steps:       parseInt($('#gi-steps').val()) || 20,
             cfg:         parseFloat($('#gi-cfg').val()) || 7,
             width:       parseInt($('#gi-width').val()) || 832,
