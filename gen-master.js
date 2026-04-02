@@ -6,6 +6,22 @@
     const MODAL_ID = 'gen-master-modal';
     const MENU_ID = 'gen-master-menu-item';
     const STYLE_ID = 'gen-master-style';
+    const MANUAL_PROMPT_BUTTON_NAME = '手动生词';
+    const RUNTIME_KEY = '__gen_master_tavern_helper_runtime__';
+    const SCRIPT_BUTTONS = Object.freeze([
+        { name: APP_NAME, visible: true },
+        { name: MANUAL_PROMPT_BUTTON_NAME, visible: true }
+    ]);
+    const SCRIPT_INFO = [
+        '酒馆助手脚本版生图大师。',
+        `入口按钮: ${APP_NAME} / ${MANUAL_PROMPT_BUTTON_NAME}`,
+        '如果没有看到按钮，请在“酒馆助手 -> 脚本库”确认脚本已启用且按钮已启用。'
+    ].join('\n');
+    const runtime = globalThis[RUNTIME_KEY] && typeof globalThis[RUNTIME_KEY] === 'object'
+        ? globalThis[RUNTIME_KEY]
+        : { actions: {}, boundEvents: new Set(), bootTimer: null };
+    runtime.actions = runtime.actions && typeof runtime.actions === 'object' ? runtime.actions : {};
+    runtime.boundEvents = runtime.boundEvents instanceof Set ? runtime.boundEvents : new Set();
 
     const BUILTIN_WORKFLOWS = [
         {
@@ -48,12 +64,35 @@
         return output;
     }
 
+    function getScriptIdSafe() {
+        if (typeof getScriptId !== 'function') {
+            return '';
+        }
+
+        try {
+            return String(getScriptId() || '');
+        } catch {
+            return '';
+        }
+    }
+
+    function getScriptVariableOptions(includeScriptId = true) {
+        const scriptId = includeScriptId ? getScriptIdSafe() : '';
+        return scriptId
+            ? { type: 'script', script_id: scriptId }
+            : { type: 'script' };
+    }
+
     function getStoredScriptVariables() {
         if (typeof getVariables === 'function') {
             try {
-                return getVariables({ type: 'script' }) || {};
+                return getVariables(getScriptVariableOptions(true)) || {};
             } catch (error) {
-                console.warn(`[${APP_NAME}] 读取脚本变量失败，回退到 localStorage`, error);
+                try {
+                    return getVariables(getScriptVariableOptions(false)) || {};
+                } catch (fallbackError) {
+                    console.warn(`[${APP_NAME}] 读取脚本变量失败，回退到 localStorage`, fallbackError);
+                }
             }
         }
 
@@ -67,9 +106,13 @@
     function replaceStoredScriptVariables(nextVariables) {
         if (typeof replaceVariables === 'function') {
             try {
-                replaceVariables(nextVariables, { type: 'script' });
+                replaceVariables(nextVariables, getScriptVariableOptions(true));
             } catch (error) {
-                console.warn(`[${APP_NAME}] 保存脚本变量失败，回退到 localStorage`, error);
+                try {
+                    replaceVariables(nextVariables, getScriptVariableOptions(false));
+                } catch (fallbackError) {
+                    console.warn(`[${APP_NAME}] 保存脚本变量失败，回退到 localStorage`, fallbackError);
+                }
             }
         }
 
@@ -83,6 +126,27 @@
     function saveSettings(nextSettings) {
         replaceStoredScriptVariables({ config: nextSettings });
         return nextSettings;
+    }
+
+    function syncScriptInfo() {
+        if (typeof replaceScriptInfo !== 'function') {
+            return;
+        }
+
+        const scriptId = getScriptIdSafe();
+        try {
+            if (scriptId && replaceScriptInfo.length >= 2) {
+                replaceScriptInfo(scriptId, SCRIPT_INFO);
+            } else {
+                replaceScriptInfo(SCRIPT_INFO);
+            }
+        } catch (error) {
+            try {
+                replaceScriptInfo(SCRIPT_INFO);
+            } catch (fallbackError) {
+                console.warn(`[${APP_NAME}] 更新脚本说明失败`, fallbackError);
+            }
+        }
     }
 
     let settings = loadSettings();
@@ -760,20 +824,107 @@
         return true;
     }
 
-    let buttonsBound = false;
-    function ensureScriptButtons() {
+    function appendScriptButtons() {
+        const scriptId = getScriptIdSafe();
+
         if (typeof appendInexistentScriptButtons === 'function') {
-            appendInexistentScriptButtons([
-                { name: APP_NAME, visible: true },
-                { name: '手动生词', visible: true }
-            ]);
+            try {
+                if (scriptId && appendInexistentScriptButtons.length >= 2) {
+                    appendInexistentScriptButtons(scriptId, SCRIPT_BUTTONS);
+                } else {
+                    appendInexistentScriptButtons(SCRIPT_BUTTONS);
+                }
+                return true;
+            } catch (error) {
+                try {
+                    appendInexistentScriptButtons(SCRIPT_BUTTONS);
+                    return true;
+                } catch (fallbackError) {
+                    console.warn(`[${APP_NAME}] 追加脚本按钮失败`, fallbackError);
+                }
+            }
         }
 
-        if (buttonsBound) return;
-        if (typeof getButtonEvent !== 'function' || typeof eventOn !== 'function') return;
+        if (typeof replaceScriptButtons === 'function') {
+            let existingButtons = [];
 
-        eventOn(getButtonEvent(APP_NAME), () => openFromMenu('basic'));
-        eventOn(getButtonEvent('手动生词'), async () => {
+            if (typeof getScriptButtons === 'function') {
+                try {
+                    existingButtons = scriptId && getScriptButtons.length >= 1
+                        ? (getScriptButtons(scriptId) || [])
+                        : (getScriptButtons() || []);
+                } catch (error) {
+                    try {
+                        existingButtons = getScriptButtons() || [];
+                    } catch {
+                        existingButtons = [];
+                    }
+                }
+            }
+
+            const mergedButtons = [...existingButtons];
+            SCRIPT_BUTTONS.forEach(button => {
+                if (!mergedButtons.some(item => item?.name === button.name)) {
+                    mergedButtons.push(button);
+                }
+            });
+
+            try {
+                if (scriptId && replaceScriptButtons.length >= 2) {
+                    replaceScriptButtons(scriptId, mergedButtons);
+                } else {
+                    replaceScriptButtons(mergedButtons);
+                }
+                return true;
+            } catch (error) {
+                try {
+                    replaceScriptButtons(mergedButtons);
+                    return true;
+                } catch (fallbackError) {
+                    console.warn(`[${APP_NAME}] 替换脚本按钮失败`, fallbackError);
+                }
+            }
+        }
+
+        return false;
+    }
+
+    function bindScriptButton(buttonName, actionKey, handler) {
+        if (typeof getButtonEvent !== 'function' || typeof eventOn !== 'function') {
+            return false;
+        }
+
+        runtime.actions[actionKey] = handler;
+
+        if (runtime.boundEvents.has(buttonName)) {
+            return true;
+        }
+
+        try {
+            const buttonEvent = getButtonEvent(buttonName);
+            eventOn(buttonEvent, async () => {
+                const activeRuntime = globalThis[RUNTIME_KEY];
+                const action = activeRuntime?.actions?.[actionKey];
+                if (typeof action !== 'function') {
+                    return;
+                }
+
+                await action();
+            });
+            runtime.boundEvents.add(buttonName);
+            return true;
+        } catch (error) {
+            console.warn(`[${APP_NAME}] 绑定按钮事件失败: ${buttonName}`, error);
+            return false;
+        }
+    }
+
+    function ensureScriptButtons() {
+        appendScriptButtons();
+        const mainBound = bindScriptButton(APP_NAME, 'open-panel', async () => {
+            openFromMenu('basic');
+        });
+        const manualBound = bindScriptButton(MANUAL_PROMPT_BUTTON_NAME, 'manual-prompt', async () => {
             try {
                 openFromMenu('prompt');
                 setStatus('处理中...');
@@ -786,16 +937,24 @@
                 toast('error', message);
             }
         });
-        buttonsBound = true;
+
+        return mainBound && manualBound;
     }
 
-    let bootTimer = null;
+    function clearBootTimer() {
+        if (runtime.bootTimer) {
+            clearInterval(runtime.bootTimer);
+            runtime.bootTimer = null;
+        }
+    }
+
     function bootOnce() {
+        syncScriptInfo();
         addStyle();
         const modal = ensureInteractiveModal();
-        const menuReady = ensureMenuItem();
-        ensureScriptButtons();
-        if (modal && menuReady) {
+        const buttonsReady = ensureScriptButtons();
+        ensureMenuItem();
+        if (modal && buttonsReady) {
             return true;
         }
         return false;
@@ -803,18 +962,27 @@
 
     function boot() {
         if (bootOnce()) return;
-        if (bootTimer) clearInterval(bootTimer);
-        bootTimer = setInterval(() => {
+        clearBootTimer();
+        runtime.bootTimer = setInterval(() => {
             if (bootOnce()) {
-                clearInterval(bootTimer);
-                bootTimer = null;
+                clearBootTimer();
             }
         }, 1000);
     }
 
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', boot, { once: true });
+    function dispose() {
+        clearBootTimer();
+    }
+
+    runtime.dispose = dispose;
+    globalThis[RUNTIME_KEY] = runtime;
+
+    if (typeof window.jQuery === 'function') {
+        window.jQuery(() => boot());
+    } else if (document.readyState === 'loading') {
+        window.addEventListener('load', boot, { once: true });
     } else {
         boot();
     }
+    window.addEventListener('pagehide', dispose, { once: true });
 })();

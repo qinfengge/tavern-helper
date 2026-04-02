@@ -1,10 +1,10 @@
 {
   "type": "script",
   "enabled": true,
-  "name": "生图大师",
+  "name": "生图大师-自动从URL更新",
   "id": "b354d35f-8b11-4f78-a7d7-0fd2df8a6c61",
   "content": "import 'https://your-cdn.example.com/gen-master.js'",
-  "info": "酒馆助手脚本版生图大师。支持自定义 LLM、角色/场景总结、ComfyUI 工作流与生图。",
+  "info": "酒馆助手脚本版生图大师。入口在酒馆助手脚本按钮“生图大师 / 手动生词”，不是 SillyTavern 扩展列表。",
   "button": {
     "enabled": true,
     "buttons": [
