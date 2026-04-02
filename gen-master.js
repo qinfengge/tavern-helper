@@ -289,6 +289,7 @@
     }
 
     function ensureModal() {
+        if (!document.body) return null;
         addStyle();
         let modal = document.getElementById(MODAL_ID);
         if (!modal) {
@@ -713,6 +714,7 @@
 
     function ensureInteractiveModal() {
         const modal = ensureModal();
+        if (!modal) return null;
         if (!modal.dataset.bound) {
             bindUi(modal);
             modal.dataset.bound = 'true';
@@ -720,24 +722,45 @@
         return modal;
     }
 
-    function ensureMenuItem() {
-        const targets = ['#extensionsMenu', '#options .options-content'];
-        for (const selector of targets) {
-            const root = document.querySelector(selector);
-            if (!root || document.getElementById(`${MENU_ID}-${selector.includes('options') ? 'options' : 'ext'}`)) continue;
-            const tag = selector.includes('options') ? 'a' : 'div';
-            const item = document.createElement(tag);
-            item.id = `${MENU_ID}-${selector.includes('options') ? 'options' : 'ext'}`;
-            item.className = selector.includes('options') ? '' : 'list-group-item flex-container flexGap5 interactable';
-            item.innerHTML = `<i class="fa-lg fa-solid fa-wand-magic-sparkles"></i><span>${APP_NAME}</span>`;
-            item.addEventListener('click', () => {
-                document.getElementById('options')?.style?.setProperty('display', 'none');
-                openPanel('basic');
-            });
-            root.appendChild(item);
+    function openFromMenu(defaultTab = 'basic') {
+        const options = document.getElementById('options');
+        if (options) {
+            options.style.display = 'none';
         }
+        openPanel(defaultTab);
     }
 
+    function ensureMenuItem() {
+        if (typeof window.jQuery === 'function') {
+            const $ = window.jQuery;
+            if ($('#extensionsMenu').length === 0) return false;
+            if (!$(`#${MENU_ID}`).length) {
+                const $item = $(
+                    `<div class="list-group-item flex-container flexGap5 interactable" id="${MENU_ID}">
+                        <div class="fa-fw fa-solid fa-wand-magic-sparkles"></div>
+                        <span>${APP_NAME}</span>
+                    </div>`
+                );
+                $item.on('click', () => openFromMenu('basic'));
+                $('#extensionsMenu').append($item);
+            }
+            return true;
+        }
+
+        const root = document.querySelector('#extensionsMenu');
+        if (!root) return false;
+        if (!document.getElementById(MENU_ID)) {
+            const item = document.createElement('div');
+            item.id = MENU_ID;
+            item.className = 'list-group-item flex-container flexGap5 interactable';
+            item.innerHTML = `<div class="fa-fw fa-solid fa-wand-magic-sparkles"></div><span>${APP_NAME}</span>`;
+            item.addEventListener('click', () => openFromMenu('basic'));
+            root.appendChild(item);
+        }
+        return true;
+    }
+
+    let buttonsBound = false;
     function ensureScriptButtons() {
         if (typeof appendInexistentScriptButtons === 'function') {
             appendInexistentScriptButtons([
@@ -746,31 +769,52 @@
             ]);
         }
 
-        if (typeof getButtonEvent === 'function' && typeof eventOn === 'function') {
-            eventOn(getButtonEvent(APP_NAME), () => openPanel('basic'));
-            eventOn(getButtonEvent('手动生词'), async () => {
-                try {
-                    openPanel('prompt');
-                    setStatus('处理中...');
-                    await buildCharacterAnchor();
-                    await buildSceneSummary();
-                    await composePrompt();
-                } catch (error) {
-                    const message = normalizeError(error);
-                    setStatus(message, true);
-                    toast('error', message);
-                }
-            });
+        if (buttonsBound) return;
+        if (typeof getButtonEvent !== 'function' || typeof eventOn !== 'function') return;
+
+        eventOn(getButtonEvent(APP_NAME), () => openFromMenu('basic'));
+        eventOn(getButtonEvent('手动生词'), async () => {
+            try {
+                openFromMenu('prompt');
+                setStatus('处理中...');
+                await buildCharacterAnchor();
+                await buildSceneSummary();
+                await composePrompt();
+            } catch (error) {
+                const message = normalizeError(error);
+                setStatus(message, true);
+                toast('error', message);
+            }
+        });
+        buttonsBound = true;
+    }
+
+    let bootTimer = null;
+    function bootOnce() {
+        addStyle();
+        const modal = ensureInteractiveModal();
+        const menuReady = ensureMenuItem();
+        ensureScriptButtons();
+        if (modal && menuReady) {
+            return true;
         }
+        return false;
     }
 
     function boot() {
-        addStyle();
-        ensureInteractiveModal();
-        ensureMenuItem();
-        ensureScriptButtons();
-        setInterval(ensureMenuItem, 1500);
+        if (bootOnce()) return;
+        if (bootTimer) clearInterval(bootTimer);
+        bootTimer = setInterval(() => {
+            if (bootOnce()) {
+                clearInterval(bootTimer);
+                bootTimer = null;
+            }
+        }, 1000);
     }
 
-    boot();
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', boot, { once: true });
+    } else {
+        boot();
+    }
 })();
