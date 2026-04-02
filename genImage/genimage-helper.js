@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         生图助手 v2
-// @version      v2.2.5
+// @version      v2.2.6
 // @description  两步LLM串行生图：角色锚点(自然语言) + 场景描述，内置Z-Image ComfyUI工作流
 // @author       GenImage Helper
 // @match        */*
@@ -356,9 +356,13 @@
     .gi-zone.top   { top:0; left:0; width:100%; height:20%; z-index:80; cursor:text; }
     .gi-ui-msg { position:absolute; bottom:10px; left:50%; transform:translateX(-50%); background:var(--nm-bg); color:var(--nm-text); padding:6px 12px; border-radius:var(--nm-radius-sm); font-size:11px; pointer-events:none; opacity:0; transition:opacity 0.3s; z-index:15; white-space:nowrap; box-shadow:3px 3px 8px var(--nm-shadow-dark); }
     .gi-ui-msg.show { opacity:1; }
-    .gi-placeholder { padding:20px; background:var(--nm-bg); border-radius:var(--nm-radius); color:var(--nm-text-muted); font-size:0.9em; text-align:center; width:100%; box-shadow:inset 3px 3px 6px var(--nm-shadow-dark),inset -2px -2px 5px var(--nm-shadow-light); }
-    .gi-placeholder.requesting { color:var(--nm-accent)!important; animation:gi-pulse 1.5s ease-in-out infinite; }
-    @keyframes gi-pulse { 0%,100%{opacity:0.6}50%{opacity:1} }
+    .gi-placeholder { padding:20px; background:var(--nm-bg); border-radius:var(--nm-radius); color:var(--nm-text-muted); font-size:0.9em; text-align:center; width:100%; min-height:180px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; box-shadow:inset 3px 3px 6px var(--nm-shadow-dark),inset -2px -2px 5px var(--nm-shadow-light); position:relative; overflow:hidden; }
+    .gi-placeholder.requesting { color:var(--nm-accent)!important; }
+    .gi-placeholder.requesting::after { content:''; position:absolute; inset:0; background:linear-gradient(105deg,transparent 35%,rgba(255,255,255,0.045) 50%,transparent 65%); animation:gi-shimmer 2s linear infinite; pointer-events:none; }
+    @keyframes gi-shimmer { from{transform:translateX(-120%)} to{transform:translateX(120%)} }
+    .gi-spinner { width:28px; height:28px; border:2.5px solid rgba(120,140,220,0.18); border-top-color:var(--nm-accent); border-radius:50%; display:none; flex-shrink:0; animation:gi-spin 0.8s linear infinite; }
+    .gi-placeholder.requesting .gi-spinner { display:block; }
+    @keyframes gi-spin { to{transform:rotate(360deg)} }
     /* Tabs */
     .gi-tab-nav { display:flex; gap:6px; margin-bottom:18px; padding:6px; background:var(--nm-bg); border-radius:var(--nm-radius); box-shadow:inset 3px 3px 8px var(--nm-shadow-dark),inset -2px -2px 6px var(--nm-shadow-light); flex-wrap:wrap; }
     .gi-tab-btn { padding:7px 12px; cursor:pointer; opacity:0.7; border-radius:var(--nm-radius-sm); font-weight:600; font-size:0.88em; transition:all 0.25s; color:var(--nm-text-muted); background:transparent; font-family:'Georgia','Times New Roman','Noto Serif SC',serif; letter-spacing:0.3px; border:none; }
@@ -1171,7 +1175,7 @@
                 if (!entry) continue;
                 if (entry.status?.status_str === 'error') throw new Error('ComfyUI generation error');
                 for (const out of Object.values(entry.outputs || {})) {
-                    if (out.images?.length) return out.images[0];
+                    if (out.images?.length) return out.images;
                 }
             } catch (e) { if (e.message.includes('error')) throw e; }
         }
@@ -1219,16 +1223,22 @@
         return result.path;
     }
 
-    async function generateComfyUIImage(positivePrompt, negativePrompt) {
+    async function generateComfyUIImage(positivePrompt, negativePrompt, onImageReady) {
         addLog('COMFYUI', `开始生图...`);
         const workflow = buildWorkflowWithParams(positivePrompt, negativePrompt);
         const promptId = await submitComfyUIPrompt(workflow);
         addLog('COMFYUI', `任务已提交: ${promptId}`);
-        const info = await pollComfyUIResult(promptId);
-        const base64 = await downloadComfyUIImage(info);
-        const url = await uploadImageToST(base64, 'png');
-        addLog('COMFYUI', `完成: ${url}`);
-        return url;
+        const infos = await pollComfyUIResult(promptId);
+        const total = infos.length;
+        const urls = [];
+        for (let i = 0; i < infos.length; i++) {
+            const base64 = await downloadComfyUIImage(infos[i]);
+            const url = await uploadImageToST(base64, 'png');
+            urls.push(url);
+            addLog('COMFYUI', `图片 ${i + 1}/${total}: ${url}`);
+            if (onImageReady) await onImageReady(url, i, total);
+        }
+        return urls;
     }
 
     // ========== APPLY INSERTIONS ==========
@@ -1313,18 +1323,23 @@
         const $placeholder = $wrap.find('.gi-placeholder');
         const $img = $wrap.find('.gi-ui-image');
         const $msg = $wrap.find('.gi-ui-msg');
-        $placeholder.addClass('requesting').text(t('requesting')).show();
+        $placeholder.addClass('requesting').show();
+        $placeholder.find('.gi-ph-text').text(t('requesting'));
         $img.hide();
         const showMsg = (txt) => { $msg.text(txt).addClass('show'); setTimeout(() => $msg.removeClass('show'), 3000); };
         try {
             const negative = settings.promptConfig.globalNegative;
-            const imageUrl = await generateComfyUIImage(prompt, negative);
-            await updateChatData(mesId, blockIdx, prompt, [imageUrl], false, false);
-            updateWrapperView($wrap, [imageUrl], 0);
-            showMsg('1/1');
+            const collectedUrls = [];
+            await generateComfyUIImage(prompt, negative, async (url, idx, total) => {
+                collectedUrls.push(url);
+                await updateChatData(mesId, blockIdx, prompt, [...collectedUrls], false, false);
+                updateWrapperView($wrap, [...collectedUrls], collectedUrls.length - 1);
+                showMsg(`${collectedUrls.length}/${total}`);
+            });
         } catch (e) {
             addLog('GEN', `失败: ${e.message}`);
-            $placeholder.removeClass('requesting').text(`❌ ${e.message.substring(0,50)}`);
+            $placeholder.removeClass('requesting');
+            $placeholder.find('.gi-ph-text').text(`❌ ${e.message.substring(0, 50)}`);
             showMsg('失败');
             await updateChatData(mesId, blockIdx, prompt, [], true, false);
         }
@@ -1343,7 +1358,7 @@
             $wrap.find('.gi-ui-msg').text(`${idx+1}/${images.length}`);
         } else {
             $img.attr('src', '').hide();
-            $ph.removeClass('requesting').text(t('waiting')).show();
+            $ph.removeClass('requesting').show().find('.gi-ph-text').text(t('waiting'));
             $wrap.find('.gi-zone.left').hide();
             $wrap.find('.gi-zone.right').addClass('gen-mode');
             $wrap.find('.gi-zone.delete').hide();
@@ -1385,7 +1400,10 @@
     function createUIHtml(prompt, images, preventAuto, blockIdx, initIdx, isScheduled=false) {
         const has = images.length > 0;
         const phClass = isScheduled ? 'gi-placeholder requesting' : 'gi-placeholder';
-        const phText  = isScheduled ? `⏳ ${t('requesting')}` : t('waiting');
+        const phText  = isScheduled ? t('requesting') : t('waiting');
+        const ov = settings.comfyuiConfig?.paramOverrides || {};
+        const imgW = ov.width || 832, imgH = ov.height || 1216;
+        const phStyle = `display:${has?'none':'block'};aspect-ratio:${imgW}/${imgH};max-height:600px;`;
         return `<div class="gi-ui-container"><div class="gi-ui-wrap"
             data-prompt="${encodeURIComponent(prompt)}"
             data-images="${encodeURIComponent(JSON.stringify(images))}"
@@ -1399,7 +1417,7 @@
                 <div class="gi-zone delete" style="display:${has?'block':'none'}"></div>
                 <div class="gi-ui-msg">${has?`${initIdx+1}/${images.length}`:''}</div>
                 <img class="gi-ui-image" src="${has?encodeImageUrl(images[initIdx]):''}" style="display:${has?'block':'none'}"/>
-                <div class="${phClass}" style="display:${has?'none':'block'}">${phText}</div>
+                <div class="${phClass}" style="${phStyle}"><div class="gi-spinner"></div><span class="gi-ph-text">${phText}</span></div>
             </div>
         </div></div>`;
     }
